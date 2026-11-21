@@ -30,7 +30,7 @@ stages the profile into `~/artools-workspace/iso-profiles`, writes `~/.config/ar
 
 `src/` is the real source; `tools/bundle.sh` regenerates the single-file `build-iso`.
 
-## Live ISO login
+## Live ISO login (hostname: blitz-live)
 
 Users `blitzart` (sudo, passwordless) and `root`; password for both: `blitz`.
 Shown on the tty login prompt (/etc/issue), in /etc/motd and in a welcome box at the start of blitzinstall.
@@ -40,3 +40,5 @@ Shown on the tty login prompt (/etc/issue), in /etc/motd and in a welcome box at
 `dinit-user-spawn` is installed and enabled (live via profile.yaml services, installed system via boot.d), so `dinitctl list` works as a normal
 user (user services in `~/.config/dinit.d`). turnstile is intentionally not used (it conflicts with elogind's
 rundir handling; the Artix wiki says not to run both).
+
+GRUB on the installed system: `GRUB_TIMEOUT=-1` (menu waits for a choice), `GRUB_TIMEOUT_STYLE=menu`.

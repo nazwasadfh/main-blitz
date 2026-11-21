@@ -457,6 +457,11 @@ phase_boot() {
         -e 's|^GRUB_DISTRIBUTOR=.*|GRUB_DISTRIBUTOR="BlitzArt"|' \
         -e 's|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 quiet"|' \
         -e 's|^#?GRUB_DISABLE_OS_PROBER=.*|GRUB_DISABLE_OS_PROBER=true|' "$g"
+    grub_set() { # key value - replace (also if commented out) or append
+        if grep -qE "^#?$1=" "$g"; then sed -i -E "s|^#?$1=.*|$1=$2|" "$g"; else echo "$1=$2" >>"$g"; fi
+    }
+    grub_set GRUB_TIMEOUT -1          # menu stays until a choice is made
+    grub_set GRUB_TIMEOUT_STYLE menu  # always show the menu
     grep -q '^GRUB_DISTRIBUTOR=' "$g" || echo 'GRUB_DISTRIBUTOR="BlitzArt"' >>"$g"
     grep -q '^GRUB_DISABLE_OS_PROBER=' "$g" || echo 'GRUB_DISABLE_OS_PROBER=true' >>"$g"
 
