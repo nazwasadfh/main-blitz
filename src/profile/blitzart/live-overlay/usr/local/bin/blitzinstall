@@ -393,7 +393,7 @@ EOF
         -e 's|^SYNC_ACL=.*|SYNC_ACL="yes"|' \
         -e 's|^TIMELINE_CREATE=.*|TIMELINE_CREATE="no"|' \
         -e 's|^NUMBER_CLEANUP=.*|NUMBER_CLEANUP="yes"|' \
-        -e 's|^NUMBER_LIMIT=.*|NUMBER_LIMIT="20"|' \
+        -e 's|^NUMBER_LIMIT=.*|NUMBER_LIMIT="50"|' \
         -e 's|^NUMBER_LIMIT_IMPORTANT=.*|NUMBER_LIMIT_IMPORTANT="10"|' \
         "$MNT/etc/snapper/configs/root"
     mkdir -p "$MNT/etc/conf.d"
@@ -445,6 +445,11 @@ EOF
 }
 
 phase_boot() {
+    msg "Enabling pacman snapshots (pre/post)"
+    install -Dm755 "$SHARE/blitzart-snap" "$MNT/usr/local/bin/blitzart-snap"
+    install -Dm644 "$SHARE/00-blitzart-snap-pre.hook"  "$MNT/etc/pacman.d/hooks/00-blitzart-snap-pre.hook"
+    install -Dm644 "$SHARE/zz-blitzart-snap-post.hook" "$MNT/etc/pacman.d/hooks/zz-blitzart-snap-post.hook"
+
     msg "Installing GRUB"
     local g="$MNT/etc/default/grub"
     sed -i -E \
@@ -483,6 +488,8 @@ case "${1:-}" in
 esac
 
 preflight
+# live ISO only: show who the live users are and the password
+[[ -f /etc/blitzart-live ]] && DLG --title "Live session" --msgbox "$(</etc/blitzart-live)" 14 66
 ensure_net
 main_menu
 clear

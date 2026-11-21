@@ -1,0 +1,49 @@
+#!/bin/bash
+# blitzart-snap pre|post  - snapper pre/post snapshots around pacman transactions.
+# Called by the pacman hooks 00-blitzart-snap-pre / zz-blitzart-snap-post.
+# - uses `snapper --no-dbus`, so it works without a running dbus
+# - skipped when pacman is driven by `blitz` (blitz update makes its own pre/post pair)
+# - never fails the transaction
+CFG=root
+STATE_DIR=/run
+
+driven_by_blitz() { # walk the process tree upwards looking for the `blitz` program
+    local pid=$PPID a=()
+    while [[ -n $pid && $pid -gt 1 ]]; do
+        mapfile -d '' a <"/proc/$pid/cmdline" 2>/dev/null
+        # argv[0] is blitz, or argv[1] is (interpreter + script: `bash /usr/local/bin/blitz`, `sudo blitz`)
+        [[ ${a[0]:-} == blitz || ${a[0]##*/} == blitz || ${a[1]:-} == blitz || ${a[1]##*/} == blitz ]] && return 0
+        pid=$(sed -E 's/^[0-9]+ \(.*\) [A-Za-z] ([0-9]+) .*/\1/' "/proc/$pid/stat" 2>/dev/null)
+    done
+    return 1
+}
+
+main() {
+    local phase=${1:-} f desc pre
+    [[ -n ${BLITZART_NO_SNAP:-} ]] && exit 0
+    command -v snapper >/dev/null 2>&1 || exit 0
+    [[ -f /etc/snapper/configs/$CFG ]] || exit 0
+    mountpoint -q /.snapshots 2>/dev/null || exit 0
+    driven_by_blitz && exit 0
+
+    f=$STATE_DIR/blitzart-snap.$PPID   # $PPID = the pacman process
+    case $phase in
+        pre)
+            desc=$(tr '\0' ' ' <"/proc/$PPID/cmdline" 2>/dev/null | sed -E 's|^[^ ]*/||; s/ +$//')
+            desc="${desc:-pacman}"; desc=${desc:0:120}
+            pre=$(snapper --no-dbus -c "$CFG" create --type pre --print-number \
+                  --cleanup-algorithm number -d "$desc" 2>/dev/null) || exit 0
+            printf '%s\n%s\n' "$pre" "$desc" >"$f"
+            ;;
+        post)
+            [[ -f $f ]] || exit 0
+            { read -r pre; read -r desc; } <"$f"; rm -f "$f"
+            [[ $pre =~ ^[0-9]+$ ]] || exit 0
+            snapper --no-dbus -c "$CFG" create --type post --pre-number "$pre" \
+                --cleanup-algorithm number -d "$desc" >/dev/null 2>&1
+            ;;
+    esac
+    exit 0
+}
+
+[[ ${BASH_SOURCE[0]} == "$0" ]] && main "$@"

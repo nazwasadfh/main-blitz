@@ -7,8 +7,8 @@
 # rootfs = base layer, livefs = live-only tools (installer, partitioning, net).
 
 live-session:
-  user: artix
-  password: artix
+  user: blitzart
+  password: blitz
   autologin: true
   use-xlibre: false
   services:

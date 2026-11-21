@@ -21,8 +21,16 @@ stages the profile into `~/artools-workspace/iso-profiles`, writes `~/.config/ar
   A snapshot of `/` therefore rolls back the whole system, home included. `/` in fstab has no `subvol=`
   so grub-btrfs snapshot entries boot correctly.
 - snapper config `root` (what `blitz` expects), baseline snapshot after install, `grub-btrfsd` as dinit service.
+- Plain `pacman`/`paru` transactions (install/upgrade/remove) get a snapper pre/post pair via pacman hooks
+  (`blitzart-snap`). Skipped when pacman is driven by `blitz` (blitz update makes its own pair) or when
+  `BLITZART_NO_SNAP=1` is set. Number cleanup keeps the last 50 (10 important).
 - os-release: NAME/PRETTY_NAME = "BlitzArt", ID=artix, ID_LIKE=arch (re-applied by a pacman hook), /etc/motd.
 
 ## Sources
 
 `src/` is the real source; `tools/bundle.sh` regenerates the single-file `build-iso`.
+
+## Live ISO login
+
+Users `blitzart` (sudo, passwordless) and `root`; password for both: `blitz`.
+Shown on the tty login prompt (/etc/issue), in /etc/motd and in a welcome box at the start of blitzinstall.

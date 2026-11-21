@@ -1,0 +1,7 @@
+BlitzArt live ISO
+
+  Users:     blitzart   (sudo, no password needed)
+             root
+  Password:  blitz      (for both users)
+
+Run `blitzinstall` to install BlitzArt (internet required).

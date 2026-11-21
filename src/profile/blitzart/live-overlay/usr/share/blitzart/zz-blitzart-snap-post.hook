@@ -1,0 +1,12 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Creating post-transaction snapshot (snapper)...
+When = PostTransaction
+Exec = /usr/local/bin/blitzart-snap post
+Depends = snapper

@@ -1,6 +1,9 @@
 
   BlitzArt live ISO (\l) - \s \r \m
 
+  Users:     blitzart  /  root
+  Password:  blitz  (both)
+
   tty1 starts the installer (blitzinstall) automatically.
-  Run `blitzinstall` again at any time.   user: artix / password: artix
+  Run `blitzinstall` again at any time.
 

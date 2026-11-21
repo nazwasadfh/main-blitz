@@ -1,0 +1,12 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Creating pre-transaction snapshot (snapper)...
+When = PreTransaction
+Exec = /usr/local/bin/blitzart-snap pre
+Depends = snapper
