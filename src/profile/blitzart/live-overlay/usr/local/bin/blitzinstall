@@ -302,7 +302,8 @@ phase_base() {
 
 enable_svc() {
     local s=$1
-    if [[ -e $MNT/etc/dinit.d/$s ]]; then
+    # dinit resolves boot.d entries by NAME through its service dirs, so the unit may live in /usr/lib/dinit.d
+    if [[ -e $MNT/etc/dinit.d/$s || -e $MNT/usr/lib/dinit.d/$s || -e $MNT/usr/local/lib/dinit.d/$s ]]; then
         mkdir -p "$MNT/etc/dinit.d/boot.d"
         ln -sf "../$s" "$MNT/etc/dinit.d/boot.d/$s"
         info "enabled service: $s"
@@ -407,7 +408,7 @@ EOF
 
     # --- services
     local s
-    for s in dbus elogind NetworkManager acpid cronie grub-btrfsd; do enable_svc "$s"; done
+    for s in dbus elogind NetworkManager acpid cronie dinit-user-spawn grub-btrfsd; do enable_svc "$s"; done
 }
 
 phase_repos() { # chaotic-aur + blackarch (network), then paru

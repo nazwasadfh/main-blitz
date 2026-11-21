@@ -33,6 +33,7 @@ rootfs:
 livefs:
   packages:
     - artix-grub-live
+    - dinit-user-spawn
     - artools-base
     - artix-archlinux-support
     - archlinux-keyring

@@ -34,3 +34,9 @@ stages the profile into `~/artools-workspace/iso-profiles`, writes `~/.config/ar
 
 Users `blitzart` (sudo, passwordless) and `root`; password for both: `blitz`.
 Shown on the tty login prompt (/etc/issue), in /etc/motd and in a welcome box at the start of blitzinstall.
+
+## User services (dinit)
+
+`dinit-user-spawn` is installed and enabled (live + installed system), so `dinitctl list` works as a normal
+user (user services in `~/.config/dinit.d`). turnstile is intentionally not used (it conflicts with elogind's
+rundir handling; the Artix wiki says not to run both).

@@ -10,7 +10,7 @@ BA_TOOLS_PKGS=(
 )
 
 BA_BASE_PKGS=(
-    base base-devel dinit elogind-dinit dbus-dinit
+    base base-devel dinit elogind-dinit dbus-dinit dinit-user-spawn
     linux-firmware intel-ucode amd-ucode
     mkinitcpio artix-keyring artix-archlinux-support archlinux-keyring
     btrfs-progs dosfstools efibootmgr grub snapper grub-btrfs inotify-tools
