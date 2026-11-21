@@ -378,6 +378,20 @@ EOF
     blitzart_apply_dots "$MNT/etc/skel"
     blitzart_apply_dots "$MNT/root"
     blitzart_apply_dots "$MNT/home/$USER_NAME"
+    # --- per-user dinit services (pipewire & co): boot.d entries for the user and for /etc/skel
+    local home svc udir
+    for home in "$MNT/etc/skel" "$MNT/home/$USER_NAME"; do
+        mkdir -p "$home/.config/dinit.d/boot.d"
+        for svc in "${BA_USER_SERVICES[@]}"; do
+            udir=""
+            for d in /etc/dinit.d/user /usr/lib/dinit.d/user /usr/local/lib/dinit.d/user; do
+                [[ -e $MNT$d/$svc ]] && { udir=$d; break; }
+            done
+            [[ -n $udir ]] || { warn "user service '$svc' not found (is ${svc}-dinit installed?)"; continue; }
+            ln -sfn "$udir/$svc" "$home/.config/dinit.d/boot.d/$svc"
+            info "enabled user service: $svc"
+        done
+    done
     ach chown -R "$USER_NAME:$USER_NAME" "/home/$USER_NAME"
 
     # --- blitz toolbox

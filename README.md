@@ -42,3 +42,9 @@ user (user services in `~/.config/dinit.d`). turnstile is intentionally not used
 rundir handling; the Artix wiki says not to run both).
 
 GRUB on the installed system: `GRUB_TIMEOUT=-1` (menu waits for a choice), `GRUB_TIMEOUT_STYLE=menu`.
+
+## Audio (PipeWire, per-user dinit services)
+
+`pipewire`, `pipewire-pulse`, `wireplumber` + their `-dinit` packages are installed. The three user services
+(`pipewire`, `pipewire-pulse`, `wireplumber`) are enabled via `~/.config/dinit.d/boot.d/` for the created user
+and for `/etc/skel` (new users); in the live session through the live skel. Requires `dinit-user-spawn`.

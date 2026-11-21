@@ -35,6 +35,9 @@ livefs:
   packages:
     - artix-grub-live
     - dinit-user-spawn
+    - pipewire
+    - pipewire-pulse
+    - wireplumber
     - artools-base
     - artix-archlinux-support
     - archlinux-keyring
@@ -64,6 +67,9 @@ livefs:
   packages-init:
     dinit:
       - artix-live-dinit
+      - pipewire-dinit
+      - pipewire-pulse-dinit
+      - wireplumber-dinit
     openrc: []
     runit: []
     s6: []

@@ -17,9 +17,14 @@ BA_BASE_PKGS=(
     networkmanager networkmanager-dinit acpid-dinit cronie-dinit
     sudo nano neovim curl wget rsync man-db man-pages
     pacman-contrib reflector
+    pipewire pipewire-pulse wireplumber
+    pipewire-dinit pipewire-pulse-dinit wireplumber-dinit
 )
 
 # kernel packages cached in the offline repo (others come from the network)
+# per-user dinit services enabled for every new user (see blitzinstall / live skel)
+BA_USER_SERVICES=(pipewire pipewire-pulse wireplumber)
+
 BA_OFFLINE_KERNELS=(linux)
 
 ba_all_offline_pkgs() {
