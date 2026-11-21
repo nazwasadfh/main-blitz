@@ -1,0 +1,69 @@
+---
+# BlitzArt common package set (dinit only).
+# Schema follows artix/iso-profiles common/common.yaml (artools >= 2026).
+packages-base:
+  - base
+  - intel-ucode
+  - amd-ucode
+  - acpi
+  - alsa-firmware
+  - b43-fwcutter
+  - btrfs-progs
+  - dhclient
+  - diffutils
+  - dmraid
+  - dosfstools
+  - efibootmgr
+  - e2fsprogs
+  - exfat-utils
+  - f2fs-tools
+  - grub
+  - artix-grub-theme
+  - inetutils
+  - iptables
+  - jfsutils
+  - linux
+  - linux-firmware
+  - linux-headers
+  - lsb-release
+  - logrotate
+  - man-db
+  - man-pages
+  - memtest86+
+  - mkinitcpio
+  - modemmanager
+  - nano
+  - nbd
+  - net-tools
+  - ntfs-3g
+  - os-prober
+  - sudo
+  - sysfsutils
+  - texinfo
+  - usbutils
+  - ex-vi-compat
+  - which
+  - wireless-regdb
+  - xfsprogs
+  - zsh
+packages-apps:
+  - inxi
+  - powertop
+packages-xorg: []
+packages-xlibre: []
+packages-misc: []
+packages-init:
+  dinit:
+    - dinit
+    - elogind-dinit
+    - dbus-dinit
+    - acpid-dinit
+    - cronie-dinit
+    - dhcpcd-dinit
+    - openssh-dinit
+    - wpa_supplicant-dinit
+  openrc: []
+  runit: []
+  s6: []
+packages-boot:
+  - iso-initcpio

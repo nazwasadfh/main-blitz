@@ -1,0 +1,4 @@
+#!/bin/bash
+# Wait for /.snapshots, then watch it and regenerate the GRUB menu on changes.
+until mountpoint -q /.snapshots; do sleep 2; done
+exec /usr/bin/grub-btrfsd /.snapshots

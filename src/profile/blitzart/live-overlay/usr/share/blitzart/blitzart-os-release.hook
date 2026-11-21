@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = filesystem
+
+[Action]
+Description = Re-applying BlitzArt branding to os-release...
+When = PostTransaction
+Exec = /usr/local/bin/blitzart-brand

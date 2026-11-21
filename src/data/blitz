@@ -1,0 +1,1620 @@
+#!/usr/bin/env bash
+# blitz - system toolbox for blitzArt
+# Base: Artix (dinit) | btrfs + snapper + grub-btrfs | repos: artix, arch, blackarch, chaotic-aur
+#
+# Usage: blitz <command> [options]      (see: blitz help, blitz <command> --help)
+
+set -uo pipefail
+
+readonly VERSION="0.1.0"
+readonly LOG_FILE="/var/log/blitz.log"
+readonly SEP=$'\037'   # field separator used for internal snapshot tables
+
+# ---------- configuration (override through the environment) ----------
+SNAPPER_CFG="${BLITZ_SNAPPER_CONFIG:-root}"
+SNAP_DIR="${BLITZ_SNAP_DIR:-/.snapshots}"
+ROOT_SUBVOL="${BLITZ_ROOT_SUBVOL:-@}"
+HOME_SUBVOL="${BLITZ_HOME_SUBVOL:-@home}"
+GRUB_CFG="${BLITZ_GRUB_CFG:-/boot/grub/grub.cfg}"
+
+# ---------- global state ----------
+ORIG_ARGS=()
+ASSUME_YES=0
+NO_GRUB=0
+DISTRO="arch"
+INIT="other"
+REAL_USER="${SUDO_USER:-}"
+TOP_MNT=""
+SNAP_IDS=()
+PICKED=()
+LIST_LIMIT=0
+
+# ---------- colors / helpers ----------
+if [[ -t 1 ]]; then
+    B=$'\e[1m'; R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; C=$'\e[36m'; N=$'\e[0m'
+else
+    B="" R="" G="" Y="" C="" N=""
+fi
+msg()  { printf '%s==>%s %s%s%s\n' "$G" "$N" "$B" "$*" "$N"; }
+info() { printf '%s  ->%s %s\n' "$C" "$N" "$*"; }
+ok()   { printf '%s  ok%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%s==> WARNING:%s %s\n' "$Y" "$N" "$*" >&2; }
+die()  { printf '%s==> ERROR:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+ask()     { local a; read -r -p "$1 [y/N] " a </dev/tty || return 1; [[ $a =~ ^[Yy]([Ee][Ss])?$ ]]; }
+confirm() { (( ASSUME_YES )) && return 0; ask "$1"; }
+
+need_root() {
+    [[ $EUID -eq 0 ]] && return 0
+    have sudo || die "Run as root or install sudo."
+    exec sudo -E "$0" "${ORIG_ARGS[@]}"
+}
+
+start_log() {
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+    exec > >(tee -a "$LOG_FILE") 2>&1
+    echo; echo "===== $(date '+%F %T') blitz ${ORIG_ARGS[*]} ====="
+}
+
+need_arg() { [[ $# -ge 2 ]] || die "Option $1 needs a value."; }
+
+cleanup_exit() { umount_top; }
+trap cleanup_exit EXIT
+
+# ---------- system detection ----------
+detect_system() {
+    DISTRO="arch"
+    # shellcheck disable=SC1091
+    [[ -r /etc/os-release ]] && . /etc/os-release
+    case "${ID:-}" in
+        artix) DISTRO="artix" ;;
+        *) [[ "${ID_LIKE:-}" == *arch* || "${ID:-}" == arch ]] || warn "Unknown distribution (${ID:-?}), treating it as Arch." ;;
+    esac
+    INIT="other"
+    if   [[ -d /run/systemd/system ]];   then INIT="systemd"
+    elif have dinitctl;                  then INIT="dinit"
+    elif have rc-status;                 then INIT="openrc"
+    elif have sv && [[ -d /run/runit ]]; then INIT="runit"
+    elif have s6-rc;                     then INIT="s6"
+    fi
+}
+
+# ---------- btrfs / snapper helpers ----------
+root_is_btrfs()   { [[ $(findmnt -no FSTYPE / 2>/dev/null) == btrfs ]]; }
+root_device()     { local s; s=$(findmnt -no SOURCE /); printf '%s' "${s%%\[*}"; }
+root_fsroot()     { awk '$5=="/"{r=$4} END{print r}' /proc/self/mountinfo; }
+home_is_subvol()  { mountpoint -q /home && [[ $(findmnt -no FSTYPE /home 2>/dev/null) == btrfs ]]; }
+snapper_ok()      { have snapper && snapper -c "$SNAPPER_CFG" get-config >/dev/null 2>&1; }
+
+# ID of the snapshot we are booted from (empty + status 1 if booted from the live subvolume)
+booted_snapshot_id() {
+    local r; r=$(root_fsroot)
+    if [[ $r =~ snapshots/([0-9]+)/snapshot$ ]]; then printf '%s' "${BASH_REMATCH[1]}"; return 0; fi
+    return 1
+}
+
+# Table of snapshots, newest first. Fields (SEP separated): id type pre date cleanup description
+snap_rows() {
+    snapper -c "$SNAPPER_CFG" list --columns number,type,pre-number,date,cleanup,description 2>/dev/null \
+    | awk -F'|' '
+        NF >= 6 {
+            id = $1; gsub(/[^0-9]/, "", id)
+            if (id == "" || id + 0 == 0) next
+            for (i = 2; i <= NF; i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
+            desc = $6; for (i = 7; i <= NF; i++) desc = desc "|" $i
+            printf "%s\037%s\037%s\037%s\037%s\037%s\n", id, $2, $3, $4, $5, desc
+        }' \
+    | sort -t"$SEP" -k1,1nr
+}
+
+# Print numbered list (1 = newest). Fills SNAP_IDS[index]=snapper-id.
+print_snapshot_list() {
+    local booted rows row id type pre date cleanup desc mark i=0
+    booted=$(booted_snapshot_id || true)
+    mapfile -t rows < <(snap_rows)
+    SNAP_IDS=()
+    (( ${#rows[@]} )) || { info "No snapshots found."; return 1; }
+    printf '%s%4s  %6s  %-7s  %-26s  %s%s\n' "$B" '#' 'ID' 'Type' 'Date' 'Description' "$N"
+    for row in "${rows[@]}"; do
+        IFS=$SEP read -r id type pre date cleanup desc <<<"$row"
+        i=$((i+1))
+        SNAP_IDS[i]=$id
+        (( LIST_LIMIT > 0 && i > LIST_LIMIT )) && break
+        mark=""
+        [[ -d $SNAP_DIR/$id/home-snapshot ]] && mark+=" ${C}[+home]${N}"
+        [[ $id == "$booted" ]] && mark+=" ${G}<- booted${N}"
+        [[ $type == post && -n $pre ]] && mark+=" (post of #$pre)"
+        printf '%4d  %6s  %-7s  %-26s  %s%s\n' "$i" "$id" "$type" "$date" "$desc" "$mark"
+    done
+}
+
+# pick_snapshots <prompt> <multi 0|1> [default-id]  -> PICKED array holds snapper IDs
+pick_snapshots() {
+    local prompt=$1 multi=$2 default=${3:-} ans tok hint="#"
+    PICKED=()
+    LIST_LIMIT=0
+    print_snapshot_list || return 1
+    (( multi )) && hint="# (space separated)"
+    [[ -n $default ]] && hint+=", Enter = booted snapshot $default"
+    echo
+    read -r -p "$prompt [$hint]: " ans </dev/tty || return 1
+    if [[ -z $ans ]]; then
+        [[ -n $default ]] || return 1
+        PICKED=("$default"); return 0
+    fi
+    for tok in $ans; do
+        [[ $tok =~ ^[0-9]+$ && -n ${SNAP_IDS[$tok]:-} ]] || { warn "Invalid selection: $tok"; return 1; }
+        PICKED+=("${SNAP_IDS[$tok]}")
+    done
+    (( multi )) || (( ${#PICKED[@]} == 1 )) || { warn "Select exactly one snapshot."; return 1; }
+    return 0
+}
+
+snap_desc() { snap_rows | awk -F"$SEP" -v id="$1" '$1==id{print $6; exit}'; }
+
+# snap_create <description> [cleanup-algorithm] [with-home 0|1]   -> sets SNAP_NEW
+SNAP_NEW=""
+snap_create() {
+    local desc=$1 cleanup=${2:-} with_home=${3:-0} args=()
+    args=(-c "$SNAPPER_CFG" create --print-number -d "$desc")
+    [[ -n $cleanup ]] && args+=(--cleanup-algorithm "$cleanup")
+    SNAP_NEW=$(snapper "${args[@]}") || return 1
+    if (( with_home )) && home_is_subvol; then
+        btrfs subvolume snapshot -r /home "$SNAP_DIR/$SNAP_NEW/home-snapshot" >/dev/null \
+            || warn "Could not snapshot /home for snapshot #$SNAP_NEW."
+    fi
+    return 0
+}
+
+# snap_delete <id>...
+snap_delete() {
+    local id rc=0 booted
+    booted=$(booted_snapshot_id || true)
+    for id in "$@"; do
+        if ! [[ $id =~ ^[0-9]+$ ]] || (( id == 0 )); then warn "Invalid snapshot ID: $id"; rc=1; continue; fi
+        if [[ $id == "$booted" ]]; then warn "Snapshot #$id is the one you are booted from; skipping."; rc=1; continue; fi
+        if [[ ! -d $SNAP_DIR/$id/snapshot ]]; then warn "Snapshot #$id does not exist."; rc=1; continue; fi
+        [[ -d $SNAP_DIR/$id/home-snapshot ]] && btrfs subvolume delete "$SNAP_DIR/$id/home-snapshot" >/dev/null 2>&1
+        if snapper -c "$SNAPPER_CFG" delete "$id"; then info "Deleted snapshot #$id"; else warn "Could not delete snapshot #$id"; rc=1; fi
+    done
+    return $rc
+}
+
+# prune_snapshots <keep> <description-regex> [no-confirm 0|1]
+prune_snapshots() {
+    local keep=$1 re=$2 noask=${3:-0} booted rows row id type pre date cleanup desc n=0 victims=() v
+    booted=$(booted_snapshot_id || true)
+    mapfile -t rows < <(snap_rows)
+    for row in "${rows[@]}"; do
+        IFS=$SEP read -r id type pre date cleanup desc <<<"$row"
+        [[ $type == post ]] && continue
+        [[ $id == "$booted" ]] && continue
+        [[ $desc =~ $re ]] || continue
+        n=$((n+1))
+        (( n > keep )) && victims+=("$id")
+    done
+    # a deleted "pre" takes its "post" with it
+    for row in "${rows[@]}"; do
+        IFS=$SEP read -r id type pre date cleanup desc <<<"$row"
+        [[ $type == post && -n $pre ]] || continue
+        for v in "${victims[@]}"; do [[ $v == "$pre" ]] && { victims+=("$id"); break; }; done
+    done
+    (( ${#victims[@]} )) || { info "Nothing to prune."; return 0; }
+    info "Snapshots to delete (${#victims[@]}): ${victims[*]}"
+    (( noask )) || confirm "Delete them?" || { info "Skipped."; return 1; }
+    snap_delete "${victims[@]}"
+}
+
+regen_grub() {
+    (( NO_GRUB )) && return 0
+    have grub-mkconfig || { info "grub-mkconfig not found, skipping GRUB update."; return 0; }
+    [[ -d $(dirname "$GRUB_CFG") ]] || { warn "$(dirname "$GRUB_CFG") not found, skipping GRUB update."; return 0; }
+    msg "Regenerating GRUB menu (grub-btrfs lists the snapshots)"
+    local out
+    if out=$(grub-mkconfig -o "$GRUB_CFG" 2>&1); then ok "GRUB menu updated"; else warn "grub-mkconfig failed:"; printf '%s\n' "$out" >&2; return 1; fi
+}
+
+# Mount the btrfs top-level (subvolid=5) so subvolumes can be renamed / deleted.
+mount_top() {
+    local dev; dev=$(root_device)
+    TOP_MNT=$(mktemp -d /run/blitz-top.XXXXXX) || die "mktemp failed."
+    if ! mount -o subvolid=5 "$dev" "$TOP_MNT"; then
+        rmdir "$TOP_MNT" 2>/dev/null; TOP_MNT=""
+        die "Could not mount the btrfs top level (subvolid=5) of $dev."
+    fi
+}
+umount_top() {
+    if [[ -n $TOP_MNT ]]; then
+        umount "$TOP_MNT" 2>/dev/null || umount -l "$TOP_MNT" 2>/dev/null
+        rmdir "$TOP_MNT" 2>/dev/null
+        TOP_MNT=""
+    fi
+    return 0
+}
+
+# Regenerate grub.cfg *inside* a (not yet booted) root subvolume.
+chroot_regen_grub() {
+    local new=$1 esp="" fs rc=1
+    [[ -x $new/usr/bin/grub-mkconfig ]] || { warn "grub-mkconfig is missing in the restored system; run 'blitz boot --regen' after reboot."; return 0; }
+    msg "Regenerating GRUB menu inside the restored system"
+    mountpoint -q /boot/efi && esp=$(findmnt -no SOURCE /boot/efi)
+    mount --bind "$new" "$new" || { warn "bind mount failed."; return 1; }
+    for fs in proc sys dev run; do
+        mkdir -p "$new/$fs"
+        mount --rbind "/$fs" "$new/$fs" && mount --make-rslave "$new/$fs"
+    done
+    mkdir -p "$new/boot/efi" "$new/.snapshots"
+    [[ -n $esp ]] && mount "$esp" "$new/boot/efi"
+    mount --bind "$SNAP_DIR" "$new/.snapshots"
+    if chroot "$new" grub-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1; then
+        ok "GRUB menu updated"; rc=0
+    else
+        warn "grub-mkconfig failed in the restored system; run 'blitz boot --regen' after reboot."
+    fi
+    umount -R "$new" 2>/dev/null || umount -Rl "$new" 2>/dev/null
+    return $rc
+}
+
+# ---------- misc shared helpers ----------
+list_pacfiles() { find /etc -xdev \( -name '*.pacnew' -o -name '*.pacsave' \) 2>/dev/null; }
+needs_reboot()  { [[ ! -d "/usr/lib/modules/$(uname -r)" ]]; }
+
+# Failed services, one per line. Returns 2 if the init system cannot be queried.
+# NOTE: the dinit detection is best-effort (parses 'dinitctl status').
+failed_services() {
+    case $INIT in
+        dinit)
+            have dinitctl || return 0
+            dinitctl list >/dev/null 2>&1 || return 2
+            local svc
+            dinitctl list 2>/dev/null | sed -E 's/^\[.*\][[:space:]]+//' | awk '{print $1}' | while read -r svc; do
+                [[ -n $svc ]] || continue
+                dinitctl status "$svc" 2>/dev/null | grep -qE 'State: STOPPED \((terminated|failed|could not|dependency)' && echo "$svc"
+            done ;;
+        openrc)
+            rc-status --crashed 2>/dev/null | awk '/crashed/{print $1}' ;;
+        systemd)
+            systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' ;;
+    esac
+    return 0
+}
+
+last_upgrade_epoch() {
+    local l; l=$(grep 'starting full system upgrade' /var/log/pacman.log 2>/dev/null | tail -1)
+    [[ -n $l ]] || return 1
+    l=${l#\[}; l=${l%%\]*}
+    date -d "$l" +%s 2>/dev/null
+}
+
+notify() {
+    (( ${NOTIFY:-0} )) || return 0
+    [[ -n $REAL_USER ]] && have notify-send || return 0
+    local uid; uid=$(id -u "$REAL_USER")
+    sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" notify-send "blitz" "$1" 2>/dev/null || true
+}
+
+do_clean_cache() { # <keep> <dry 0|1>
+    local keep=$1 dry=$2
+    have paccache || { warn "Install 'pacman-contrib' to use paccache."; return 1; }
+    msg "Cleaning package cache (keeping the last $keep versions)"
+    if (( dry )); then paccache -dk"$keep"; paccache -duk0
+    else paccache -rk"$keep"; paccache -ruk0; fi
+}
+
+do_mirrors() { # <country> <count>
+    local country=$1 count=$2 art=/etc/pacman.d/mirrorlist arch=/etc/pacman.d/mirrorlist-arch tmp tmp_in args=()
+    msg "Refreshing mirror lists"
+    if [[ -f $art ]]; then
+        if have rankmirrors; then
+            cp -f "$art" "$art.bak"
+            tmp=$(mktemp); tmp_in=$(mktemp)
+            sed 's/^#[[:space:]]*Server/Server/' "$art.bak" > "$tmp_in"
+            if rankmirrors -n "$count" "$tmp_in" > "$tmp" && [[ -s $tmp ]]; then
+                install -m644 "$tmp" "$art"; ok "Artix mirrors ranked (top $count)"
+            else
+                warn "rankmirrors failed, keeping the previous Artix mirror list."
+            fi
+            rm -f "$tmp" "$tmp_in"
+        else
+            warn "Install 'pacman-contrib' (rankmirrors) to rank the Artix mirrors."
+        fi
+    fi
+    if [[ -f $arch ]]; then
+        if have reflector; then
+            cp -f "$arch" "$arch.bak"
+            args=(--latest 20 --protocol https --sort rate --save "$arch")
+            [[ -n $country ]] && args+=(--country "$country")
+            if reflector "${args[@]}"; then ok "Arch mirrors refreshed"
+            else warn "reflector failed, restoring the previous Arch mirror list."; cp -f "$arch.bak" "$arch"; fi
+        else
+            warn "Install 'reflector' to refresh the Arch mirrors."
+        fi
+    fi
+    [[ -f $art || -f $arch ]] || warn "No mirror lists found in /etc/pacman.d."
+}
+
+show_news() {
+    have curl || { warn "curl is required for --news."; return; }
+    local url name
+    for url in "Arch|https://archlinux.org/feeds/news/" "Artix|https://artixlinux.org/feed.php"; do
+        name=${url%%|*}; url=${url#*|}
+        msg "Latest $name news"
+        curl -fsS --max-time 10 "$url" 2>/dev/null \
+            | grep -oP '(?<=<title>).*?(?=</title>)' | sed 's/<!\[CDATA\[//; s/\]\]>//' | sed -n '2,6p' | sed 's/^/   * /' \
+            || warn "Could not fetch the $name news feed."
+    done
+}
+
+post_summary() {
+    echo; msg "Summary"
+    local pacfiles orphans f
+    mapfile -t pacfiles < <(list_pacfiles)
+    if (( ${#pacfiles[@]} )); then
+        warn "Config files that need manual merging (${#pacfiles[@]}):"
+        printf '   %s\n' "${pacfiles[@]}"
+        info "Use: blitz pacnew --merge"
+    else
+        info "No .pacnew/.pacsave files found."
+    fi
+    mapfile -t orphans < <(pacman -Qdtq 2>/dev/null)
+    if (( ${#orphans[@]} )); then
+        warn "Orphaned packages (${#orphans[@]}): ${orphans[*]}"
+        info "Remove after reviewing: blitz clean --orphans"
+    fi
+    f=$(failed_services 2>/dev/null)
+    if [[ -n $f ]]; then warn "Services in failed state:"; echo "$f" | sed 's/^/   /'; fi
+    if needs_reboot; then warn "The kernel was updated - a REBOOT is recommended (running: $(uname -r))."
+    else info "Running kernel ($(uname -r)) still matches the installed modules."; fi
+}
+
+# ======================================================================
+#  blitz update
+# ======================================================================
+usage_update() { cat <<'EOF'
+Usage: blitz update [options]        (aliases: upd, u)
+
+Safe full system update: pre-update snapshot, keyring refresh, full upgrade,
+AUR/Flatpak, GRUB refresh and a post-update summary.
+
+  -m, --mirrors          refresh the mirror lists first
+  -a, --aur              also update AUR packages (paru or yay)
+  -f, --flatpak          also update Flatpak apps
+  -c, --clean            clean the package cache afterwards
+  -n, --news             show the latest Arch and Artix news
+  -S, --no-snapshot      skip the pre/post update snapshot
+  -y, --yes              do not ask for confirmation (--noconfirm)
+  -d, --dry-run          only list the pending updates
+      --ignore PKG[,PKG] do not upgrade the given packages
+      --only WHAT        repo | aur | flatpak
+      --keep N           keep only the N newest "blitz update" snapshots
+      --no-grub          do not regenerate the GRUB menu
+      --rollback-on-fail restore the pre-update snapshot if the upgrade fails
+      --reboot           reboot when finished
+      --reboot-if-needed reboot only if the kernel changed
+      --notify           desktop notification when finished
+  -h, --help             show this help
+EOF
+}
+
+cmd_update() {
+    local DO_MIRRORS=0 DO_AUR=0 DO_FLATPAK=0 DO_CLEAN=0 DO_NEWS=0 DO_SNAPSHOT=1 DO_REPO=1
+    local DRY=0 REBOOT=0 REBOOT_IF=0 KEEP=0 ROLLBACK=0 ONLY="" IGNORE=""
+    NOTIFY=0
+    while (( $# )); do
+        case $1 in
+            -m|--mirrors)       DO_MIRRORS=1 ;;
+            -a|--aur)           DO_AUR=1 ;;
+            -f|--flatpak)       DO_FLATPAK=1 ;;
+            -c|--clean)         DO_CLEAN=1 ;;
+            -n|--news)          DO_NEWS=1 ;;
+            -S|--no-snapshot)   DO_SNAPSHOT=0 ;;
+            -y|--yes)           ASSUME_YES=1 ;;
+            -d|--dry-run)       DRY=1 ;;
+            --ignore)           need_arg "$@"; IGNORE=$2; shift ;;
+            --only)             need_arg "$@"; ONLY=$2; shift ;;
+            --keep)             need_arg "$@"; KEEP=$2; shift ;;
+            --no-grub)          NO_GRUB=1 ;;
+            --rollback-on-fail) ROLLBACK=1 ;;
+            --reboot)           REBOOT=1 ;;
+            --reboot-if-needed) REBOOT_IF=1 ;;
+            --notify)           NOTIFY=1 ;;
+            -h|--help)          usage_update; exit 0 ;;
+            *) die "Unknown option: $1 (use blitz update --help)" ;;
+        esac
+        shift
+    done
+    [[ $KEEP =~ ^[0-9]+$ ]] || die "--keep needs a number."
+    case $ONLY in
+        "")      ;;
+        repo)    DO_AUR=0; DO_FLATPAK=0 ;;
+        aur)     DO_REPO=0; DO_AUR=1; DO_FLATPAK=0 ;;
+        flatpak) DO_REPO=0; DO_AUR=0; DO_FLATPAK=1 ;;
+        *) die "--only accepts: repo, aur, flatpak." ;;
+    esac
+
+    need_root
+    start_log
+    msg "Updating blitzArt using blitz update"
+    detect_system
+    msg "Detected: $DISTRO (init: $INIT)"
+
+    local noconf=() upflags=()
+    (( ASSUME_YES )) && noconf+=(--noconfirm)
+    [[ -n $IGNORE ]] && upflags+=(--ignore "$IGNORE")
+
+    # ---- pre-flight ----
+    msg "Checking network connectivity"
+    if ! ping -c1 -W3 archlinux.org >/dev/null 2>&1 && ! ping -c1 -W3 1.1.1.1 >/dev/null 2>&1; then
+        die "No network connection."
+    fi
+    local b; b=$(booted_snapshot_id || true)
+    [[ -n $b ]] && die "You are booted from snapshot #$b (read-only). Restore it first: blitz restore"
+    if findmnt -no OPTIONS / | tr ',' '\n' | grep -qx ro; then die "The root filesystem is mounted read-only."; fi
+    local free_kb; free_kb=$(df --output=avail / | tail -1 | tr -d ' ')
+    (( free_kb < 2*1024*1024 )) && warn "Low disk space on / ($(( free_kb/1024 )) MiB). The update may fail."
+
+    local lock=/var/lib/pacman/db.lck
+    if [[ -e $lock ]]; then
+        if pgrep -x pacman >/dev/null || pgrep -x paru >/dev/null || pgrep -x yay >/dev/null; then
+            die "Another pacman/AUR helper process is running. Wait for it to finish."
+        fi
+        warn "Found stale $lock, removing it."
+        rm -f "$lock"
+    fi
+
+    (( DO_NEWS )) && show_news
+
+    # ---- dry run ----
+    if (( DRY )); then
+        local rc
+        if (( DO_REPO )); then
+            have checkupdates || die "checkupdates (pacman-contrib) is required for --dry-run."
+            msg "Pending repository updates"
+            checkupdates; rc=$?
+            (( rc == 2 )) && info "No pending repository updates."
+            (( rc == 1 )) && warn "checkupdates failed."
+        fi
+        if (( DO_AUR )) && [[ -n $REAL_USER && $REAL_USER != root ]]; then
+            msg "Pending AUR updates"
+            if have paru; then sudo -u "$REAL_USER" paru -Qua || info "No pending AUR updates."
+            elif have yay; then sudo -u "$REAL_USER" yay -Qua || info "No pending AUR updates."; fi
+        fi
+        if (( DO_FLATPAK )) && have flatpak; then msg "Pending Flatpak updates"; flatpak remote-ls --updates; fi
+        msg "Dry run finished - nothing was changed."
+        return 0
+    fi
+
+    # ---- pre-update snapshot ----
+    local PRE_NUM=""
+    if (( DO_SNAPSHOT && DO_REPO )); then
+        if root_is_btrfs && snapper_ok; then
+            msg "Creating pre-update snapshot (snapper)"
+            PRE_NUM=$(snapper -c "$SNAPPER_CFG" create --type pre --print-number --cleanup-algorithm number -d "blitz update") \
+                && info "Snapshot #$PRE_NUM" || { warn "snapper snapshot failed."; PRE_NUM=""; }
+        else
+            info "Root is not btrfs or snapper config '$SNAPPER_CFG' is missing - skipping snapshot."
+        fi
+    fi
+
+    (( DO_MIRRORS )) && do_mirrors "" 10
+
+    if (( DO_REPO )); then
+        # ---- keyrings ----
+        # Refresh databases + keyrings first, then upgrade right away
+        # (pacman -Sy without a following -Su would be a partial upgrade).
+        local KEYRINGS=() k
+        for k in archlinux-keyring artix-keyring blackarch-keyring chaotic-keyring; do
+            pacman -Qq "$k" >/dev/null 2>&1 && KEYRINGS+=("$k")
+        done
+        msg "Syncing databases and refreshing keyrings: ${KEYRINGS[*]:-none}"
+        if (( ${#KEYRINGS[@]} )); then
+            if ! pacman -Sy --needed "${noconf[@]}" "${KEYRINGS[@]}"; then
+                warn "Keyring update failed, trying to rebuild the keys."
+                pacman-key --init
+                pacman-key --populate "${KEYRINGS[@]/-keyring/}" 2>/dev/null || pacman-key --populate
+                pacman -Sy --needed "${noconf[@]}" "${KEYRINGS[@]}" || die "Could not refresh keyrings."
+            fi
+        else
+            pacman -Sy || die "Database sync failed."
+        fi
+
+        # ---- main upgrade ----
+        msg "Upgrading system (pacman -Su)"
+        if ! pacman -Su "${noconf[@]}" "${upflags[@]}"; then
+            notify "Update FAILED"
+            if (( ROLLBACK )) && [[ -n $PRE_NUM ]]; then
+                warn "Upgrade failed - rolling back to snapshot #$PRE_NUM."
+                restore_core "$PRE_NUM" 1 0 0
+                exit 1
+            fi
+            die "pacman -Su failed. Check the messages above and $LOG_FILE."
+        fi
+
+        if [[ -n $PRE_NUM ]]; then
+            snapper -c "$SNAPPER_CFG" create --type post --pre-number "$PRE_NUM" --cleanup-algorithm number -d "blitz update" >/dev/null \
+                && info "Post-update snapshot created (pair of #$PRE_NUM)" || warn "Post-update snapshot failed."
+        fi
+        (( KEEP > 0 )) && root_is_btrfs && snapper_ok && prune_snapshots "$KEEP" '^blitz update' 1
+        regen_grub
+    fi
+
+    # ---- AUR ----
+    if (( DO_AUR )); then
+        if [[ -z $REAL_USER || $REAL_USER == root ]]; then
+            warn "AUR: refusing to build packages as root. Run via sudo from a regular user account."
+        elif have paru; then
+            msg "Updating AUR packages (paru)"
+            sudo -u "$REAL_USER" paru -Sua "${noconf[@]}" "${upflags[@]}"
+        elif have yay; then
+            msg "Updating AUR packages (yay)"
+            sudo -u "$REAL_USER" yay -Sua "${noconf[@]}" "${upflags[@]}"
+        else
+            warn "Neither paru nor yay found, skipping AUR."
+        fi
+    fi
+
+    # ---- Flatpak ----
+    if (( DO_FLATPAK )); then
+        if have flatpak; then msg "Updating Flatpak apps"; flatpak update -y
+        else warn "Flatpak is not installed."; fi
+    fi
+
+    (( DO_CLEAN )) && do_clean_cache 2 0
+
+    post_summary
+    echo
+    msg "Done. Log: $LOG_FILE"
+    notify "Update finished"
+
+    if (( REBOOT )) || { (( REBOOT_IF )) && needs_reboot; }; then
+        msg "Rebooting in 5 seconds (Ctrl+C to cancel)"; sleep 5; sync; reboot
+    fi
+}
+
+# ======================================================================
+#  blitz snapshot  (list | create | delete | restore | diff | prune)
+# ======================================================================
+usage_snapshot() { cat <<'EOF'
+Usage: blitz snapshot <action> [options]       (aliases: snap, s)
+
+Actions:
+  list,   ls              list snapshots (newest first: # 1 = newest)
+  create, new             create a snapshot of / (and /home)
+  delete, rm [ID...]      delete snapshots (no ID: pick from the list)
+  restore    [ID]         restore a snapshot (no ID: pick from the list)
+  diff    [A [B]]         show changed files between A and B (B = current)
+  prune                   delete the oldest snapshots, keep N newest
+
+Run 'blitz snapshot <action> --help' for details.
+Note: 'blitz restore' is a shortcut for 'blitz snapshot restore'.
+EOF
+}
+
+usage_snapshot_list() { cat <<'EOF'
+Usage: blitz snapshot list [-n N]
+  -n, --limit N     show only the N newest snapshots
+The list is ordered from the newest (# 1) to the oldest; ID is the snapper number.
+EOF
+}
+usage_snapshot_create() { cat <<'EOF'
+Usage: blitz snapshot create [options]
+  -d, --description TEXT   description (default: "manual snapshot")
+      --cleanup ALG        snapper cleanup algorithm (number|timeline|empty-pre-post)
+      --no-home            do not snapshot /home along with /
+      --no-grub            do not regenerate the GRUB menu
+EOF
+}
+usage_snapshot_delete() { cat <<'EOF'
+Usage: blitz snapshot delete [ID...] [options]
+With no ID the snapshot list is shown and you pick by '#' (several allowed).
+  -y, --yes       do not ask for confirmation
+      --no-grub   do not regenerate the GRUB menu
+EOF
+}
+usage_snapshot_restore() { cat <<'EOF'
+Usage: blitz snapshot restore [ID] [options]       (also: blitz restore)
+
+Makes a snapshot the new live system:
+  1. the current @ is renamed to @.broken-<date> (kept for safety)
+  2. a writable copy of the snapshot becomes the new @
+  3. if the snapshot has a /home copy, @home is replaced the same way
+  4. the GRUB menu is regenerated inside the restored system
+
+Without an ID the snapshot list is shown. Press Enter to restore the snapshot you
+are currently booted from, or pick another one by its '#'.
+
+  -t, --to ID     snapshot ID (snapper number) to restore
+      --no-home   do not touch @home
+      --no-grub   do not regenerate the GRUB menu
+  -n, --dry-run   show what would happen
+      --reboot    reboot when done
+  -y, --yes       do not ask for confirmation
+EOF
+}
+
+snapshot_preflight() {
+    root_is_btrfs || die "The root filesystem is not btrfs."
+    have snapper  || die "snapper is not installed."
+    snapper_ok    || die "snapper config '$SNAPPER_CFG' not found (set BLITZ_SNAPPER_CONFIG if it has another name)."
+}
+
+cmd_snapshot() {
+    local sub=${1:-list}
+    (( $# )) && shift
+    case $sub in
+        list|ls|l)         snapshot_list "$@" ;;
+        create|new|add|c)  snapshot_create "$@" ;;
+        delete|del|rm|d)   snapshot_delete "$@" ;;
+        restore|rollback|r) snapshot_restore "$@" ;;
+        diff)              snapshot_diff "$@" ;;
+        prune)             snapshot_prune "$@" ;;
+        -h|--help|help)    usage_snapshot ;;
+        *) die "Unknown snapshot action: $sub (use blitz snapshot --help)" ;;
+    esac
+}
+
+snapshot_list() {
+    LIST_LIMIT=0
+    while (( $# )); do
+        case $1 in
+            -n|--limit) need_arg "$@"; LIST_LIMIT=$2; shift ;;
+            -h|--help)  usage_snapshot_list; return 0 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+        shift
+    done
+    [[ $LIST_LIMIT =~ ^[0-9]+$ ]] || die "--limit needs a number."
+    need_root
+    snapshot_preflight
+    local b; b=$(booted_snapshot_id || true)
+    if [[ -n $b ]]; then info "Booted from snapshot #$b"; else info "Booted from the live subvolume ($ROOT_SUBVOL)"; fi
+    print_snapshot_list
+}
+
+snapshot_create() {
+    local desc="manual snapshot" cleanup="" with_home=1
+    while (( $# )); do
+        case $1 in
+            -d|--description) need_arg "$@"; desc=$2; shift ;;
+            --cleanup)        need_arg "$@"; cleanup=$2; shift ;;
+            --no-home)        with_home=0 ;;
+            --no-grub)        NO_GRUB=1 ;;
+            -h|--help)        usage_snapshot_create; return 0 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+        shift
+    done
+    need_root; start_log
+    snapshot_preflight
+    msg "Creating snapshot"
+    snap_create "$desc" "$cleanup" "$with_home" || die "snapper could not create the snapshot."
+    info "Snapshot #$SNAP_NEW created: $desc"
+    if (( with_home )); then
+        if [[ -d $SNAP_DIR/$SNAP_NEW/home-snapshot ]]; then info "Includes a read-only copy of /home"
+        else info "/home is not a separate btrfs subvolume - not included."; fi
+    fi
+    regen_grub
+}
+
+snapshot_delete() {
+    local ids=()
+    while (( $# )); do
+        case $1 in
+            -y|--yes)  ASSUME_YES=1 ;;
+            --no-grub) NO_GRUB=1 ;;
+            -h|--help) usage_snapshot_delete; return 0 ;;
+            -*) die "Unknown option: $1" ;;
+            *)  ids+=("$1") ;;
+        esac
+        shift
+    done
+    need_root; start_log
+    snapshot_preflight
+    if (( ${#ids[@]} == 0 )); then
+        pick_snapshots "Snapshot(s) to delete" 1 || die "Nothing selected."
+        ids=("${PICKED[@]}")
+    fi
+    info "Will delete snapshot(s): ${ids[*]}"
+    confirm "Continue?" || die "Aborted."
+    snap_delete "${ids[@]}"
+    regen_grub
+}
+
+snapshot_diff() {
+    local a="" b=0
+    while (( $# )); do
+        case $1 in
+            -h|--help) echo "Usage: blitz snapshot diff [A [B]]   (B defaults to the current system)"; return 0 ;;
+            -*) die "Unknown option: $1" ;;
+            *) if [[ -z $a ]]; then a=$1; else b=$1; fi ;;
+        esac
+        shift
+    done
+    need_root
+    snapshot_preflight
+    if [[ -z $a ]]; then pick_snapshots "Compare which snapshot with the current system" 0 || die "Nothing selected."; a=${PICKED[0]}; fi
+    [[ $a =~ ^[0-9]+$ && $b =~ ^[0-9]+$ ]] || die "Snapshot IDs must be numbers."
+    msg "Changes between #$a and ${b/#0/current}"
+    snapper -c "$SNAPPER_CFG" status "$a..$b"
+}
+
+snapshot_prune() {
+    local keep=10 re='.'
+    while (( $# )); do
+        case $1 in
+            --keep)    need_arg "$@"; keep=$2; shift ;;
+            --match)   need_arg "$@"; re=$2; shift ;;
+            -y|--yes)  ASSUME_YES=1 ;;
+            --no-grub) NO_GRUB=1 ;;
+            -h|--help) echo "Usage: blitz snapshot prune [--keep N] [--match REGEX] [-y] [--no-grub]   (default: keep 10)"; return 0 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+        shift
+    done
+    [[ $keep =~ ^[0-9]+$ ]] || die "--keep needs a number."
+    need_root; start_log
+    snapshot_preflight
+    msg "Pruning snapshots (keeping the $keep newest matching '$re')"
+    prune_snapshots "$keep" "$re" 0 && regen_grub
+}
+
+snapshot_restore() {
+    local id="" dry=0 reboot=0 no_home=0
+    while (( $# )); do
+        case $1 in
+            -t|--to)      need_arg "$@"; id=$2; shift ;;
+            --no-home)    no_home=1 ;;
+            --no-grub)    NO_GRUB=1 ;;
+            -n|--dry-run) dry=1 ;;
+            --reboot)     reboot=1 ;;
+            -y|--yes)     ASSUME_YES=1 ;;
+            -h|--help)    usage_snapshot_restore; return 0 ;;
+            [0-9]*)       id=$1 ;;
+            *) die "Unknown option: $1 (use blitz snapshot restore --help)" ;;
+        esac
+        shift
+    done
+    need_root; start_log
+    snapshot_preflight
+    mountpoint -q "$SNAP_DIR" || die "$SNAP_DIR must be a separate subvolume (e.g. @snapshots) mounted at $SNAP_DIR."
+
+    if [[ -z $id ]]; then
+        local booted; booted=$(booted_snapshot_id || true)
+        pick_snapshots "Snapshot to restore" 0 "$booted" || die "No snapshot selected."
+        id=${PICKED[0]}
+    fi
+    restore_core "$id" "$no_home" "$dry" "$reboot"
+}
+
+# restore_core <id> <no_home> <dry> <reboot>
+restore_core() {
+    local id=$1 no_home=$2 dry=$3 reboot=$4
+    [[ $id =~ ^[0-9]+$ && -d $SNAP_DIR/$id/snapshot ]] || die "Snapshot '$id' does not exist."
+    local ts with_home=0 desc broken booted
+    ts=$(date +%Y%m%d-%H%M%S)
+    broken="$ROOT_SUBVOL.broken-$ts"
+    desc=$(snap_desc "$id")
+    booted=$(booted_snapshot_id || true)
+    if (( ! no_home )); then
+        if [[ -d $SNAP_DIR/$id/home-snapshot ]]; then with_home=1
+        else info "Snapshot #$id has no /home copy - $HOME_SUBVOL stays untouched."; fi
+    fi
+
+    msg "Restore plan"
+    info "Snapshot:  #$id ${desc:+($desc)}${booted:+ $([[ $id == "$booted" ]] && echo '[the one you are booted from]')}"
+    info "Root:      $ROOT_SUBVOL -> $broken (kept), new $ROOT_SUBVOL = copy of snapshot #$id"
+    (( with_home )) && info "Home:      $HOME_SUBVOL -> $HOME_SUBVOL.broken-$ts (kept), new $HOME_SUBVOL = copy of the /home snapshot"
+    (( NO_GRUB )) || info "GRUB:      menu will be regenerated inside the restored system"
+    if (( dry )); then msg "Dry run - nothing was changed."; return 0; fi
+    confirm "Restore snapshot #$id now?" || die "Aborted."
+
+    mount_top
+    [[ -d $TOP_MNT/$ROOT_SUBVOL ]] || die "Subvolume '$ROOT_SUBVOL' not found at the top level of the filesystem (set BLITZ_ROOT_SUBVOL)."
+
+    msg "Restoring root"
+    mv "$TOP_MNT/$ROOT_SUBVOL" "$TOP_MNT/$broken" || die "Could not rename $ROOT_SUBVOL."
+    if ! btrfs subvolume snapshot "$SNAP_DIR/$id/snapshot" "$TOP_MNT/$ROOT_SUBVOL" >/dev/null; then
+        mv "$TOP_MNT/$broken" "$TOP_MNT/$ROOT_SUBVOL"
+        die "Creating the new $ROOT_SUBVOL failed; nothing was changed."
+    fi
+    mkdir -p "$TOP_MNT/$ROOT_SUBVOL/.snapshots"
+    ok "Root restored from snapshot #$id"
+
+    if (( with_home )); then
+        msg "Restoring home"
+        if [[ -d $TOP_MNT/$HOME_SUBVOL ]]; then
+            mv "$TOP_MNT/$HOME_SUBVOL" "$TOP_MNT/$HOME_SUBVOL.broken-$ts"
+            if btrfs subvolume snapshot "$SNAP_DIR/$id/home-snapshot" "$TOP_MNT/$HOME_SUBVOL" >/dev/null; then
+                ok "$HOME_SUBVOL restored"
+            else
+                mv "$TOP_MNT/$HOME_SUBVOL.broken-$ts" "$TOP_MNT/$HOME_SUBVOL"
+                warn "Restoring $HOME_SUBVOL failed; it was left untouched."
+            fi
+        else
+            warn "Subvolume '$HOME_SUBVOL' not found at the top level; /home not restored."
+        fi
+    fi
+
+    (( NO_GRUB )) || chroot_regen_grub "$TOP_MNT/$ROOT_SUBVOL"
+    umount_top
+
+    echo
+    msg "Snapshot #$id restored. Reboot to boot into it."
+    info "The previous system is kept as '$broken' (remove later with: blitz clean --broken)."
+    if (( reboot )) || ask "Reboot now?"; then sync; reboot; fi
+}
+
+# ======================================================================
+#  blitz health
+# ======================================================================
+usage_health() { cat <<'EOF'
+Usage: blitz health [options]        (aliases: check, alive)
+
+Checks that the system is OK. Sections:
+  pkg  btrfs  disk  boot  services  system  network
+
+  -o, --only A[,B]   run only these sections
+  -s, --skip A[,B]   skip these sections
+  -f, --fix          try to fix what can be fixed safely (needs root)
+  -j, --json         machine readable output
+  -q, --quiet        print only warnings and failures
+  -v, --verbose      show details
+  -h, --help         show this help
+
+Exit status: 0 = all OK, 1 = warnings, 2 = failures.
+Without root some checks (SMART, btrfs stats, dmesg, ...) are skipped.
+EOF
+}
+
+H_OK=0 H_WARN=0 H_FAIL=0 H_RESULTS=()
+H_JSON=0 H_FIX=0 H_QUIET=0 H_VERBOSE=0 H_ONLY="" H_SKIP=""
+readonly H_SECTIONS="pkg btrfs disk boot services system network"
+
+hres() { # hres <section> <ok|warn|fail|skip> <message>
+    local sec=$1 st=$2; shift 2
+    H_RESULTS+=("$sec|$st|$*")
+    case $st in ok) H_OK=$((H_OK+1)) ;; warn) H_WARN=$((H_WARN+1)) ;; fail) H_FAIL=$((H_FAIL+1)) ;; esac
+    (( H_JSON )) && return 0
+    (( H_QUIET )) && [[ $st == ok || $st == skip ]] && return 0
+    case $st in
+        ok)   printf '  %s[ OK ]%s %s\n'   "$G" "$N" "$*" ;;
+        warn) printf '  %s[WARN]%s %s\n'   "$Y" "$N" "$*" ;;
+        fail) printf '  %s[FAIL]%s %s\n'   "$R" "$N" "$*" ;;
+        skip) printf '  %s[SKIP]%s %s\n'   "$C" "$N" "$*" ;;
+    esac
+}
+hverb() { (( H_VERBOSE && ! H_JSON )) && printf '%s\n' "$*" | sed 's/^/           /'; return 0; }
+section_enabled() {
+    [[ -n $H_ONLY && ",$H_ONLY," != *",$1,"* ]] && return 1
+    [[ -n $H_SKIP && ",$H_SKIP," == *",$1,"* ]] && return 1
+    return 0
+}
+json_esc() { local s=$1; s=${s//\\/\\\\}; s=${s//\"/\\\"}; printf '%s' "$s"; }
+
+health_pkg() {
+    local lock=/var/lib/pacman/db.lck out n k missing=()
+    if [[ -e $lock ]]; then
+        if pgrep -x pacman >/dev/null || pgrep -x paru >/dev/null || pgrep -x yay >/dev/null; then
+            hres pkg warn "pacman/AUR helper is currently running"
+        else
+            hres pkg fail "Stale pacman lock ($lock)"
+            if (( H_FIX )); then rm -f "$lock" && hres pkg ok "Fixed: removed the stale lock"; fi
+        fi
+    else
+        hres pkg ok "No pacman lock"
+    fi
+
+    for k in artix-keyring archlinux-keyring; do pacman -Qq "$k" >/dev/null 2>&1 || missing+=("$k"); done
+    if (( ${#missing[@]} )); then hres pkg warn "Keyring package not installed: ${missing[*]}"; else hres pkg ok "Keyrings installed"; fi
+
+    if out=$(pacman -Dk 2>&1); then hres pkg ok "Package database is consistent"
+    else hres pkg fail "Package database problems (pacman -Dk)"; hverb "$out"; fi
+
+    n=$(pacman -Qkq 2>/dev/null | wc -l)
+    if (( n == 0 )); then hres pkg ok "All package files present"
+    else hres pkg warn "$n package file(s) missing (pacman -Qk)"; hverb "$(pacman -Qkq 2>/dev/null | head -20)"; fi
+
+    local last now age
+    if last=$(last_upgrade_epoch); then
+        now=$(date +%s); age=$(( (now - last) / 86400 ))
+        if (( age > 30 )); then hres pkg warn "Last full upgrade was $age days ago (blitz update)"
+        else hres pkg ok "Last full upgrade: $age day(s) ago"; fi
+    else
+        hres pkg warn "No full upgrade found in pacman.log"
+    fi
+
+    n=$(list_pacfiles | wc -l)
+    if (( n )); then hres pkg warn "$n .pacnew/.pacsave file(s) (blitz pacnew)"; hverb "$(list_pacfiles)"
+    else hres pkg ok "No .pacnew/.pacsave files"; fi
+
+    n=$(pacman -Qdtq 2>/dev/null | wc -l)
+    if (( n )); then hres pkg warn "$n orphaned package(s) (blitz clean --orphans)"; hverb "$(pacman -Qdtq 2>/dev/null)"
+    else hres pkg ok "No orphaned packages"; fi
+}
+
+health_btrfs() {
+    if ! root_is_btrfs; then hres btrfs skip "Root is not btrfs"; return; fi
+    local b out s started age un
+    b=$(booted_snapshot_id || true)
+    if [[ -n $b ]]; then hres btrfs warn "Booted from snapshot #$b (read-only; use: blitz restore)"
+    else hres btrfs ok "Booted from the live subvolume"; fi
+
+    if mountpoint -q "$SNAP_DIR"; then hres btrfs ok "$SNAP_DIR is mounted"
+    else hres btrfs warn "$SNAP_DIR is not a separate mounted subvolume"; fi
+
+    if (( EUID )); then
+        hres btrfs skip "Device errors, scrub, allocation, snapper (need root)"
+        return
+    fi
+
+    out=$(btrfs device stats / 2>/dev/null | awk '$2+0>0')
+    if [[ -z $out ]]; then hres btrfs ok "No btrfs device errors"
+    else hres btrfs fail "btrfs device errors detected (blitz btrfs errors)"; hverb "$out"; fi
+
+    s=$(btrfs scrub status / 2>/dev/null)
+    if [[ -z $s || $s == *"no stats available"* ]]; then
+        hres btrfs warn "Never scrubbed (blitz btrfs scrub)"
+    else
+        if grep -q 'Error summary:' <<<"$s" && ! grep -q 'no errors found' <<<"$s"; then hres btrfs fail "Last scrub found errors"
+        else
+            started=$(sed -n 's/^Scrub started: *//p' <<<"$s" | head -1)
+            age=$(( ( $(date +%s) - $(date -d "$started" +%s 2>/dev/null || echo 0) ) / 86400 ))
+            if (( age > 90 )); then hres btrfs warn "Last scrub was over $age days ago (blitz btrfs scrub)"
+            else hres btrfs ok "Last scrub OK (${age} day(s) ago)"; fi
+        fi
+    fi
+
+    un=$(btrfs filesystem usage -b / 2>/dev/null | awk '/Device unallocated:/{print $3; exit}')
+    if [[ -n $un ]]; then
+        if (( un < 1024*1024*1024 )); then hres btrfs warn "Less than 1 GiB unallocated (blitz btrfs balance)"
+        else hres btrfs ok "Unallocated space: $(( un/1024/1024 )) MiB"; fi
+    fi
+
+    if snapper_ok; then
+        n=$(snap_rows | wc -l); hres btrfs ok "snapper config '$SNAPPER_CFG' OK ($n snapshots)"
+    else
+        hres btrfs warn "snapper config '$SNAPPER_CFG' not found"
+    fi
+}
+
+health_disk() {
+    local mp pct avail d res seen=" "
+    for mp in / /home /boot /boot/efi /.snapshots /var; do
+        mountpoint -q "$mp" || [[ $mp == / ]] || continue
+        read -r pct avail < <(df --output=pcent,avail -m "$mp" 2>/dev/null | tail -1 | tr -d '%')
+        [[ -n ${pct:-} ]] || continue
+        if   (( pct >= 97 )); then hres disk fail "$mp is ${pct}% full (${avail} MiB free)"
+        elif (( pct >= 90 )); then hres disk warn "$mp is ${pct}% full (${avail} MiB free)"
+        else hres disk ok "$mp: ${pct}% used (${avail} MiB free)"; fi
+    done
+    if (( EUID )); then hres disk skip "SMART health (needs root)"; return; fi
+    if ! have smartctl; then hres disk skip "SMART health (smartmontools not installed)"; return; fi
+    for d in $(lsblk -dno NAME,TYPE | awk '$2=="disk" && $1 ~ /^(sd|nvme|vd|hd|mmcblk)/{print $1}'); do
+        res=$(smartctl -H "/dev/$d" 2>&1)
+        if   grep -qE 'PASSED|: OK' <<<"$res"; then hres disk ok "SMART /dev/$d: PASSED"
+        elif grep -q 'FAILED' <<<"$res";        then hres disk fail "SMART /dev/$d: FAILED - back up your data!"
+        else hres disk skip "SMART /dev/$d: not available"; fi
+    done
+}
+
+health_boot() {
+    local mode=BIOS base k n newest=""
+    [[ -d /sys/firmware/efi ]] && mode=UEFI
+    hres boot ok "Boot mode: $mode"
+    if [[ $mode == UEFI ]]; then
+        if mountpoint -q /boot/efi; then
+            if findmnt -no OPTIONS /boot/efi | tr ',' '\n' | grep -qx rw; then hres boot ok "ESP mounted read-write at /boot/efi"
+            else hres boot warn "ESP is mounted read-only"; fi
+        else
+            hres boot warn "ESP is not mounted at /boot/efi"
+        fi
+    fi
+
+    if [[ -s $GRUB_CFG ]]; then hres boot ok "$GRUB_CFG exists"
+    else
+        hres boot fail "$GRUB_CFG is missing or empty"
+        if (( H_FIX )) && have grub-mkconfig; then grub-mkconfig -o "$GRUB_CFG" >/dev/null 2>&1 && hres boot ok "Fixed: regenerated grub.cfg"; fi
+    fi
+
+    if pacman -Qq grub-btrfs >/dev/null 2>&1; then
+        if [[ -f /boot/grub/grub-btrfs.cfg ]]; then
+            n=$(grep -c '^[[:space:]]*menuentry' /boot/grub/grub-btrfs.cfg 2>/dev/null)
+            hres boot ok "grub-btrfs menu present ($n snapshot entries)"
+        else
+            hres boot warn "grub-btrfs installed but no snapshot menu generated (blitz boot --regen)"
+        fi
+    else
+        hres boot warn "grub-btrfs is not installed (snapshots will not appear in GRUB)"
+    fi
+
+    if needs_reboot; then hres boot warn "Running kernel $(uname -r) has no modules installed - reboot needed"
+    else hres boot ok "Running kernel matches installed modules"; fi
+
+    for k in /usr/lib/modules/*/pkgbase; do
+        [[ -f $k ]] || continue
+        base=$(<"$k")
+        if [[ -f /boot/vmlinuz-$base && -f /boot/initramfs-$base.img ]]; then
+            hres boot ok "Kernel '$base': image and initramfs present"
+            [[ -z $newest || /boot/vmlinuz-$base -nt $newest ]] && newest=/boot/vmlinuz-$base
+        else
+            hres boot fail "Kernel '$base': image or initramfs missing in /boot"
+            if (( H_FIX )) && have mkinitcpio; then mkinitcpio -P >/dev/null 2>&1 && hres boot ok "Fixed: rebuilt initramfs images"; fi
+        fi
+    done
+    if [[ -n $newest && -s $GRUB_CFG && $newest -nt $GRUB_CFG ]]; then
+        hres boot warn "grub.cfg is older than the newest kernel (blitz boot --regen)"
+        if (( H_FIX )) && have grub-mkconfig; then grub-mkconfig -o "$GRUB_CFG" >/dev/null 2>&1 && hres boot ok "Fixed: regenerated grub.cfg"; fi
+    fi
+
+    if grep -qi 'GenuineIntel' /proc/cpuinfo; then
+        pacman -Qq intel-ucode >/dev/null 2>&1 && hres boot ok "intel-ucode installed" || hres boot warn "intel-ucode is not installed"
+    elif grep -qi 'AuthenticAMD' /proc/cpuinfo; then
+        pacman -Qq amd-ucode >/dev/null 2>&1 && hres boot ok "amd-ucode installed" || hres boot warn "amd-ucode is not installed"
+    fi
+}
+
+health_services() {
+    local f rc
+    f=$(failed_services); rc=$?
+    if (( rc == 2 )); then hres services skip "Cannot query $INIT (needs root)"
+    elif [[ $INIT == other || $INIT == runit || $INIT == s6 ]]; then hres services skip "Service check not supported for init '$INIT'"
+    elif [[ -n $f ]]; then hres services fail "Failed services: $(tr '\n' ' ' <<<"$f")"
+    else hres services ok "No failed services ($INIT)"; fi
+}
+
+health_system() {
+    local n mem_total mem_avail pct load cores
+    if findmnt -no OPTIONS / | tr ',' '\n' | grep -qx ro && [[ -z $(booted_snapshot_id || true) ]]; then
+        hres system fail "Root filesystem is mounted read-only"
+    else
+        hres system ok "Root filesystem state is fine"
+    fi
+
+    if (( EUID )); then hres system skip "Kernel errors in dmesg (needs root)"
+    else
+        n=$(dmesg --level=err,crit,alert,emerg 2>/dev/null | wc -l)
+        if (( n )); then hres system warn "$n kernel error message(s) in dmesg"; hverb "$(dmesg --level=err,crit,alert,emerg 2>/dev/null | tail -5)"
+        else hres system ok "No kernel errors in dmesg"; fi
+    fi
+
+    if pgrep -x -f 'chronyd|ntpd|openntpd|ntpd-rs|systemd-timesyncd|sntpd' >/dev/null 2>&1; then hres system ok "Time synchronisation daemon running"
+    else hres system warn "No time synchronisation daemon found (chrony/ntpd)"; fi
+
+    if [[ -n $(swapon --noheadings --show=NAME 2>/dev/null) ]]; then hres system ok "Swap/zram active"
+    else hres system warn "No swap or zram active"; fi
+
+    mem_total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo); mem_avail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+    if [[ -n $mem_total && -n $mem_avail ]]; then
+        pct=$(( mem_avail * 100 / mem_total ))
+        if (( pct < 10 )); then hres system warn "Low memory: only ${pct}% available"; else hres system ok "Memory: ${pct}% available"; fi
+    fi
+
+    load=$(awk '{print int($1)}' /proc/loadavg); cores=$(nproc)
+    if (( load > cores * 2 )); then hres system warn "High load average ($(cut -d' ' -f1 /proc/loadavg) on $cores cores)"
+    else hres system ok "Load average OK ($(cut -d' ' -f1 /proc/loadavg))"; fi
+}
+
+health_network() {
+    if ping -c1 -W3 1.1.1.1 >/dev/null 2>&1; then hres network ok "Internet reachable (1.1.1.1)"
+    else hres network fail "No internet connectivity"; return; fi
+    if getent hosts archlinux.org >/dev/null 2>&1; then hres network ok "DNS resolution works"
+    else hres network fail "DNS resolution failed"; fi
+}
+
+cmd_health() {
+    local s
+    H_OK=0 H_WARN=0 H_FAIL=0 H_RESULTS=()
+    while (( $# )); do
+        case $1 in
+            -o|--only) need_arg "$@"; H_ONLY=$2; shift ;;
+            -s|--skip) need_arg "$@"; H_SKIP=$2; shift ;;
+            -f|--fix)  H_FIX=1 ;;
+            -j|--json) H_JSON=1 ;;
+            -q|--quiet) H_QUIET=1 ;;
+            -v|--verbose) H_VERBOSE=1 ;;
+            -h|--help) usage_health; exit 0 ;;
+            *) die "Unknown option: $1 (use blitz health --help)" ;;
+        esac
+        shift
+    done
+    for s in ${H_ONLY//,/ } ${H_SKIP//,/ }; do
+        [[ " $H_SECTIONS " == *" $s "* ]] || die "Unknown section: $s (available: $H_SECTIONS)"
+    done
+    (( H_FIX )) && need_root
+    detect_system
+    (( H_JSON || H_QUIET )) || msg "Checking blitzArt health"
+
+    for s in $H_SECTIONS; do
+        section_enabled "$s" || continue
+        (( H_JSON || H_QUIET )) || printf '\n%s%s%s\n' "$B" "$s" "$N"
+        "health_$s"
+    done
+
+    local status=ok code=0
+    (( H_WARN )) && { status=warn; code=1; }
+    (( H_FAIL )) && { status=fail; code=2; }
+
+    if (( H_JSON )); then
+        local first=1 sec st m
+        printf '{"status":"%s","ok":%d,"warn":%d,"fail":%d,"checks":[' "$status" "$H_OK" "$H_WARN" "$H_FAIL"
+        for r in "${H_RESULTS[@]}"; do
+            IFS='|' read -r sec st m <<<"$r"
+            (( first )) || printf ','
+            first=0
+            printf '{"section":"%s","status":"%s","message":"%s"}' "$sec" "$st" "$(json_esc "$m")"
+        done
+        printf ']}\n'
+    elif (( ! H_QUIET )) || (( code )); then
+        echo
+        case $status in
+            ok)   msg "Everything looks good: $H_OK checks passed." ;;
+            warn) warn "$H_WARN warning(s), $H_OK ok." ;;
+            fail) printf '%s==> %d failure(s), %d warning(s), %d ok.%s\n' "$R" "$H_FAIL" "$H_WARN" "$H_OK" "$N" ;;
+        esac
+    fi
+    exit $code
+}
+
+# ======================================================================
+#  blitz clean
+# ======================================================================
+usage_clean() { cat <<'EOF'
+Usage: blitz clean [options]
+
+With no options only the package cache is cleaned; other cleanable items are reported.
+
+      --cache        clean the package cache (paccache)
+      --orphans      remove orphaned packages
+      --broken       delete old @.broken-* subvolumes left behind by 'restore'
+      --flatpak      remove unused Flatpak runtimes
+  -a, --all          all of the above
+  -k, --keep N       package versions to keep in the cache (default 2)
+  -n, --dry-run      show what would be removed
+  -y, --yes          do not ask for confirmation
+  -h, --help         show this help
+Old snapshots are handled by: blitz snapshot prune
+EOF
+}
+
+cmd_clean() {
+    local cache=0 orph=0 broken=0 flat=0 keep=2 dry=0 any=0
+    while (( $# )); do
+        case $1 in
+            --cache)   cache=1; any=1 ;;
+            --orphans) orph=1; any=1 ;;
+            --broken)  broken=1; any=1 ;;
+            --flatpak) flat=1; any=1 ;;
+            -a|--all)  cache=1 orph=1 broken=1 flat=1; any=1 ;;
+            -k|--keep) need_arg "$@"; keep=$2; shift ;;
+            -n|--dry-run) dry=1 ;;
+            -y|--yes)  ASSUME_YES=1 ;;
+            -h|--help) usage_clean; return 0 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+        shift
+    done
+    [[ $keep =~ ^[0-9]+$ ]] || die "--keep needs a number."
+    (( any )) || cache=1
+    need_root; start_log
+    detect_system
+
+    if (( cache )); then do_clean_cache "$keep" "$dry"; fi
+
+    local orphans=() noconf=()
+    (( ASSUME_YES )) && noconf+=(--noconfirm)
+    mapfile -t orphans < <(pacman -Qdtq 2>/dev/null)
+    if (( orph )); then
+        if (( ${#orphans[@]} )); then
+            msg "Orphaned packages (${#orphans[@]}): ${orphans[*]}"
+            if (( dry )); then info "Dry run - not removing."
+            elif confirm "Remove them?"; then pacman -Rns "${noconf[@]}" "${orphans[@]}"; fi
+        else info "No orphaned packages."; fi
+    elif (( ${#orphans[@]} )); then
+        info "${#orphans[@]} orphaned package(s) can be removed with: blitz clean --orphans"
+    fi
+
+    if (( flat )); then
+        if have flatpak; then msg "Removing unused Flatpak runtimes"; (( dry )) || flatpak uninstall --unused -y
+        else warn "Flatpak is not installed."; fi
+    fi
+
+    if root_is_btrfs; then
+        mount_top
+        local cur p name rel list=()
+        cur=$(root_fsroot); cur=${cur#/}
+        for p in "$TOP_MNT"/*.broken-*; do
+            [[ -e $p ]] || continue
+            name=${p##*/}
+            [[ $name == "$cur" ]] && continue
+            btrfs subvolume show "$p" >/dev/null 2>&1 && list+=("$name")
+        done
+        if (( broken )); then
+            if (( ${#list[@]} )); then
+                msg "Old subvolumes from earlier restores: ${list[*]}"
+                if (( dry )); then info "Dry run - not deleting."
+                elif confirm "Delete them permanently?"; then
+                    for name in "${list[@]}"; do
+                        # nested subvolumes first (deepest first), then the subvolume itself
+                        btrfs subvolume list -o "$TOP_MNT/$name" 2>/dev/null | sed 's/.* path //' | tac | while read -r rel; do
+                            btrfs subvolume delete "$TOP_MNT/$rel" >/dev/null 2>&1
+                        done
+                        if btrfs subvolume delete "$TOP_MNT/$name" >/dev/null; then info "Deleted $name"; else warn "Could not delete $name"; fi
+                    done
+                fi
+            else info "No old @.broken-* subvolumes."; fi
+        elif (( ${#list[@]} )); then
+            info "${#list[@]} old subvolume(s) from earlier restores: blitz clean --broken"
+        fi
+        umount_top
+    fi
+}
+
+# ======================================================================
+#  blitz mirrors
+# ======================================================================
+usage_mirrors() { cat <<'EOF'
+Usage: blitz mirrors [options]
+  -n, --number N       Artix mirrors to keep after ranking (default 10)
+  -c, --country CODE   country filter for the Arch mirrors (reflector), e.g. PL,DE
+  -s, --show           show the active mirrors
+  -r, --restore        restore the previous mirror lists (*.bak)
+  -h, --help           show this help
+EOF
+}
+
+cmd_mirrors() {
+    local count=10 country="" show=0 restore=0 f
+    while (( $# )); do
+        case $1 in
+            -n|--number)  need_arg "$@"; count=$2; shift ;;
+            -c|--country) need_arg "$@"; country=$2; shift ;;
+            -s|--show)    show=1 ;;
+            -r|--restore) restore=1 ;;
+            -h|--help)    usage_mirrors; return 0 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+        shift
+    done
+    [[ $count =~ ^[0-9]+$ ]] || die "--number needs a number."
+    if (( show )); then
+        for f in /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist-arch; do
+            [[ -f $f ]] || continue
+            msg "$f"; grep -E '^Server' "$f" | sed 's/^/   /'
+        done
+        return 0
+    fi
+    need_root; start_log
+    if (( restore )); then
+        for f in /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist-arch; do
+            [[ -f $f.bak ]] && cp -f "$f.bak" "$f" && ok "Restored $f"
+        done
+        return 0
+    fi
+    do_mirrors "$country" "$count"
+}
+
+# ======================================================================
+#  blitz pacnew
+# ======================================================================
+usage_pacnew() { cat <<'EOF'
+Usage: blitz pacnew [options]
+  (no options)   list .pacnew / .pacsave files
+  -d, --diff     show a diff for every .pacnew file
+  -m, --merge    merge interactively with pacdiff (pacman-contrib)
+  -h, --help     show this help
+EOF
+}
+
+cmd_pacnew() {
+    local mode=list files f
+    while (( $# )); do
+        case $1 in
+            -d|--diff)  mode=diff ;;
+            -m|--merge) mode=merge ;;
+            -h|--help)  usage_pacnew; return 0 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+        shift
+    done
+    [[ $mode == merge ]] && { need_root; have pacdiff || die "Install 'pacman-contrib' (pacdiff)."; exec pacdiff; }
+    mapfile -t files < <(list_pacfiles)
+    (( ${#files[@]} )) || { info "No .pacnew/.pacsave files found."; return 0; }
+    msg "${#files[@]} file(s) need attention"
+    for f in "${files[@]}"; do
+        printf '   %s\n' "$f"
+        if [[ $mode == diff && $f == *.pacnew ]]; then
+            diff -u --color=auto "${f%.pacnew}" "$f" | sed 's/^/      /'
+        fi
+    done
+    info "Merge them with: blitz pacnew --merge"
+}
+
+# ======================================================================
+#  blitz btrfs
+# ======================================================================
+usage_btrfs() { cat <<'EOF'
+Usage: blitz btrfs [action] [options]
+Actions:
+  status (default)   usage, errors, scrub state, snapshot count
+  usage              detailed space usage
+  errors             device error counters
+  scrub [start|status|cancel] [-w|--wait]
+                     checksum verification (runs in background unless --wait)
+  balance [-u N|--usage N] [--status|--cancel]
+                     light balance of chunks filled up to N% (default 50)
+EOF
+}
+
+cmd_btrfs() {
+    local sub=${1:-status}
+    (( $# )) && shift
+    case $sub in -h|--help|help) usage_btrfs; return 0 ;; esac
+    root_is_btrfs || die "The root filesystem is not btrfs."
+    need_root
+    case $sub in
+        status|st)
+            msg "btrfs status"
+            btrfs filesystem show / 2>/dev/null | sed 's/^/   /'
+            echo; btrfs filesystem usage -h / 2>/dev/null | sed -n '1,14p' | sed 's/^/   /'
+            echo; msg "Device errors"; btrfs device stats / | sed 's/^/   /'
+            echo; msg "Last scrub"; btrfs scrub status / | sed 's/^/   /'
+            echo; findmnt -no OPTIONS / | tr ',' '\n' | grep -E '^(compress|subvol|ssd|discard|space_cache)' | sed 's/^/   /'
+            ;;
+        usage|df) btrfs filesystem usage -h / ;;
+        errors|stats) btrfs device stats / ;;
+        scrub)
+            local act=start wait=0
+            while (( $# )); do
+                case $1 in
+                    start|status|cancel) act=$1 ;;
+                    -w|--wait) wait=1 ;;
+                    *) die "Unknown option: $1" ;;
+                esac
+                shift
+            done
+            case $act in
+                start) if (( wait )); then btrfs scrub start -B /; else btrfs scrub start /; info "Running in background: blitz btrfs scrub status"; fi ;;
+                status) btrfs scrub status / ;;
+                cancel) btrfs scrub cancel / ;;
+            esac ;;
+        balance)
+            local usage=50 act=start
+            while (( $# )); do
+                case $1 in
+                    -u|--usage) need_arg "$@"; usage=$2; shift ;;
+                    --status)   act=status ;;
+                    --cancel)   act=cancel ;;
+                    *) die "Unknown option: $1" ;;
+                esac
+                shift
+            done
+            [[ $usage =~ ^[0-9]+$ ]] || die "--usage needs a number."
+            case $act in
+                start)  msg "Balancing chunks up to ${usage}% full"; btrfs balance start -dusage="$usage" -musage="$usage" / ;;
+                status) btrfs balance status / ;;
+                cancel) btrfs balance cancel / ;;
+            esac ;;
+        *) die "Unknown btrfs action: $sub (use blitz btrfs --help)" ;;
+    esac
+}
+
+# ======================================================================
+#  blitz boot
+# ======================================================================
+usage_boot() { cat <<'EOF'
+Usage: blitz boot [options]
+  (no options)       show bootloader status
+  -r, --regen        regenerate the GRUB menu (including grub-btrfs snapshot entries)
+  -i, --initramfs    rebuild all initramfs images (mkinitcpio or dracut)
+  -a, --all          both of the above
+  -h, --help         show this help
+EOF
+}
+
+cmd_boot() {
+    local regen=0 initramfs=0 k base mode=BIOS
+    while (( $# )); do
+        case $1 in
+            -r|--regen)     regen=1 ;;
+            -i|--initramfs) initramfs=1 ;;
+            -a|--all)       regen=1; initramfs=1 ;;
+            -h|--help)      usage_boot; return 0 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+        shift
+    done
+    if (( regen || initramfs )); then
+        need_root; start_log
+        if (( initramfs )); then
+            msg "Rebuilding initramfs images"
+            if have mkinitcpio; then mkinitcpio -P
+            elif have dracut;   then dracut --regenerate-all --force
+            else warn "Neither mkinitcpio nor dracut found."; fi
+        fi
+        (( regen )) && regen_grub
+        return 0
+    fi
+
+    [[ -d /sys/firmware/efi ]] && mode=UEFI
+    msg "Boot status"
+    info "Mode:        $mode"
+    if mountpoint -q /boot/efi; then info "ESP:         $(findmnt -no SOURCE,FSTYPE,OPTIONS /boot/efi)"; else info "ESP:         not mounted at /boot/efi"; fi
+    info "/boot:       $(findmnt -no FSTYPE /boot 2>/dev/null || findmnt -no FSTYPE /) (same fs as /: $([[ -z $(findmnt -no TARGET /boot 2>/dev/null) ]] && echo yes || echo no))"
+    [[ -f $GRUB_CFG ]] && info "grub.cfg:    $(date -r "$GRUB_CFG" '+%F %T')" || warn "$GRUB_CFG is missing"
+    if pacman -Qq grub-btrfs >/dev/null 2>&1; then
+        info "grub-btrfs:  installed ($(grep -c '^[[:space:]]*menuentry' /boot/grub/grub-btrfs.cfg 2>/dev/null || echo 0) snapshot entries)"
+    else info "grub-btrfs:  not installed"; fi
+    for k in /usr/lib/modules/*/pkgbase; do
+        [[ -f $k ]] || continue
+        base=$(<"$k")
+        info "Kernel:      $base  vmlinuz: $([[ -f /boot/vmlinuz-$base ]] && echo yes || echo MISSING)  initramfs: $([[ -f /boot/initramfs-$base.img ]] && echo yes || echo MISSING)"
+    done
+    have efibootmgr && [[ $mode == UEFI ]] && { echo; efibootmgr 2>/dev/null | sed 's/^/   /'; }
+    return 0
+}
+
+# ======================================================================
+#  blitz kernel
+# ======================================================================
+usage_kernel() { cat <<'EOF'
+Usage: blitz kernel [action]
+  list (default)             installed kernels (running one is marked)
+  install <name> [options]   install a kernel + headers, e.g. lts, zen, hardened
+  remove  <name> [options]   remove a kernel + headers (never the running/last one)
+Options:
+  --no-headers   do not install/remove the headers package
+  -S, --no-snapshot   skip the snapshot taken before the change
+  -y, --yes      do not ask for confirmation
+  --no-grub      do not regenerate the GRUB menu
+EOF
+}
+
+cmd_kernel() {
+    local sub=${1:-list} name="" headers=1 snap=1 k base running pkgs=() noconf=() others=0 ver
+    (( $# )) && shift
+    while (( $# )); do
+        case $1 in
+            --no-headers) headers=0 ;;
+            -S|--no-snapshot) snap=0 ;;
+            -y|--yes)  ASSUME_YES=1 ;;
+            --no-grub) NO_GRUB=1 ;;
+            -h|--help) usage_kernel; return 0 ;;
+            -*) die "Unknown option: $1" ;;
+            *)  name=$1 ;;
+        esac
+        shift
+    done
+    case $sub in -h|--help|help) usage_kernel; return 0 ;; esac
+    running=$(uname -r)
+    (( ASSUME_YES )) && noconf+=(--noconfirm)
+
+    case $sub in
+        list|ls)
+            msg "Installed kernels"
+            for k in /usr/lib/modules/*/; do
+                ver=${k%/}; ver=${ver##*/}
+                base=$(cat "$k/pkgbase" 2>/dev/null || echo "?")
+                printf '   %-16s %-14s %s\n' "$base" "$ver" "$([[ $ver == "$running" ]] && echo '<- running')"
+            done ;;
+        install|add)
+            [[ -n $name ]] || die "Usage: blitz kernel install <name>"
+            [[ $name == linux* ]] || name="linux-$name"
+            pacman -Si "$name" >/dev/null 2>&1 || die "Package '$name' not found in the repositories."
+            need_root; start_log
+            pkgs=("$name"); (( headers )) && pacman -Si "$name-headers" >/dev/null 2>&1 && pkgs+=("$name-headers")
+            if (( snap )) && root_is_btrfs && snapper_ok; then
+                msg "Creating snapshot"; snap_create "blitz kernel install $name" number 0 && info "Snapshot #$SNAP_NEW"
+            fi
+            msg "Installing ${pkgs[*]}"
+            pacman -S --needed "${noconf[@]}" "${pkgs[@]}" || die "Installation failed."
+            regen_grub
+            msg "Done. Reboot and pick the new kernel in GRUB (Advanced options)." ;;
+        remove|rm)
+            [[ -n $name ]] || die "Usage: blitz kernel remove <name>"
+            [[ $name == linux* ]] || name="linux-$name"
+            pacman -Qq "$name" >/dev/null 2>&1 || die "Kernel package '$name' is not installed."
+            base=$(cat "/usr/lib/modules/$running/pkgbase" 2>/dev/null || true)
+            [[ $name == "$base" ]] && die "Refusing to remove the running kernel ($name). Boot another kernel first."
+            for k in /usr/lib/modules/*/pkgbase; do
+                [[ -f $k && $(<"$k") != "$name" ]] && others=$((others+1))
+            done
+            (( others )) || die "Refusing to remove the only installed kernel."
+            need_root; start_log
+            pkgs=("$name"); (( headers )) && pacman -Qq "$name-headers" >/dev/null 2>&1 && pkgs+=("$name-headers")
+            confirm "Remove ${pkgs[*]}?" || die "Aborted."
+            if (( snap )) && root_is_btrfs && snapper_ok; then
+                msg "Creating snapshot"; snap_create "blitz kernel remove $name" number 0 && info "Snapshot #$SNAP_NEW"
+            fi
+            pacman -Rns "${noconf[@]}" "${pkgs[@]}" || die "Removal failed."
+            regen_grub ;;
+        *) die "Unknown kernel action: $sub (use blitz kernel --help)" ;;
+    esac
+}
+
+# ======================================================================
+#  blitz info
+# ======================================================================
+cmd_info() {
+    case ${1:-} in -h|--help) echo "Usage: blitz info    show a system overview"; return 0 ;; esac
+    detect_system
+    kv() { printf '  %s%-15s%s %s\n' "$B" "$1" "$N" "$2"; }
+    local b last repos aur cpu mem sn
+    msg "blitzArt system information"
+    kv "blitz"     "$VERSION"
+    kv "OS"        "${PRETTY_NAME:-${NAME:-unknown}}"
+    kv "Kernel"    "$(uname -r)"
+    kv "Init"      "$INIT"
+    kv "Uptime"    "$(uptime -p 2>/dev/null | sed 's/^up //')"
+    cpu=$(awk -F': ' '/model name/{print $2; exit}' /proc/cpuinfo)
+    kv "CPU"       "${cpu:-unknown} ($(nproc) threads)"
+    mem=$(free -h | awk '/^Mem:/{print $3 " / " $2}')
+    kv "Memory"    "$mem"
+    kv "Boot mode" "$([[ -d /sys/firmware/efi ]] && echo UEFI || echo BIOS)"
+    kv "Root fs"   "$(findmnt -no FSTYPE,SOURCE / | sed 's/\[.*\]//')"
+    if root_is_btrfs; then
+        b=$(booted_snapshot_id || true)
+        if [[ -n $b ]]; then kv "Booted from" "snapshot #$b (read-only)"; else kv "Booted from" "live subvolume ($(findmnt -no OPTIONS / | grep -o 'subvol=[^,]*' | head -1 | cut -d= -f2))"; fi
+        if (( EUID == 0 )) && snapper_ok; then sn=$(snap_rows | wc -l); kv "Snapshots" "$sn (snapper config '$SNAPPER_CFG')"
+        else kv "Snapshots" "n/a (run as root)"; fi
+    fi
+    if last=$(last_upgrade_epoch); then kv "Last upgrade" "$(date -d "@$last" '+%F %T') ($(( ( $(date +%s) - last ) / 86400 )) day(s) ago)"; fi
+    kv "Packages"  "$(pacman -Qnq 2>/dev/null | wc -l) native, $(pacman -Qmq 2>/dev/null | wc -l) foreign"
+    repos=$(grep -oE '^\[[^]]+\]' /etc/pacman.conf | grep -v '^\[options\]' | tr -d '[]' | tr '\n' ' ')
+    kv "Repositories" "$repos"
+    aur=$(for h in paru yay; do have "$h" && echo -n "$h "; done)
+    kv "AUR helper" "${aur:-none}"
+    kv "Flatpak"   "$(have flatpak && echo installed || echo no)"
+    kv "grub-btrfs" "$(pacman -Qq grub-btrfs >/dev/null 2>&1 && echo installed || echo no)"
+}
+
+# ======================================================================
+#  main
+# ======================================================================
+usage_main() { cat <<EOF
+blitz $VERSION - system toolbox for blitzArt
+
+Usage: blitz <command> [options]
+
+Commands:
+  update,   upd, u          safe system update (snapshot, keyrings, repos, AUR, Flatpak)
+  snapshot, snap, s         list | create | delete | restore | diff | prune
+  restore                   shortcut for 'snapshot restore'
+  health,   check, alive    check that the system is healthy
+  clean                     package cache, orphans, old @.broken-* subvolumes
+  mirrors                   refresh / rank mirror lists
+  pacnew                    list, diff and merge .pacnew/.pacsave files
+  btrfs                     status, usage, errors, scrub, balance
+  boot                      bootloader status, GRUB / initramfs regeneration
+  kernel                    list, install and remove kernels
+  info                      system overview
+  version                   print the version
+  help                      this help
+
+Run 'blitz <command> --help' for the options of a command.
+EOF
+}
+
+main() {
+    ORIG_ARGS=("$@")
+    (( $# )) || { usage_main; exit 0; }
+    local cmd=$1; shift
+    case $cmd in
+        update|upd|u)               cmd_update "$@" ;;
+        snapshot|snap|s)            cmd_snapshot "$@" ;;
+        restore)                    snapshot_restore "$@" ;;
+        health|check|alive)         cmd_health "$@" ;;
+        clean)                      cmd_clean "$@" ;;
+        mirrors)                    cmd_mirrors "$@" ;;
+        pacnew)                     cmd_pacnew "$@" ;;
+        btrfs)                      cmd_btrfs "$@" ;;
+        boot)                       cmd_boot "$@" ;;
+        kernel)                     cmd_kernel "$@" ;;
+        info)                       cmd_info "$@" ;;
+        version|-V|--version)       echo "blitz $VERSION" ;;
+        help|-h|--help)             usage_main ;;
+        *) die "Unknown command: $cmd (use blitz help)" ;;
+    esac
+}
+
+main "$@"

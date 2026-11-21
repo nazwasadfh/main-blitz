@@ -1,0 +1,68 @@
+---
+# BlitzArt Linux live ISO (dinit).
+#
+# Build:  ./build-iso      (wraps: buildiso -p blitzart -i dinit)
+#
+# The live system is a plain console: autologin on tty1 starts `blitzinstall`.
+# rootfs = base layer, livefs = live-only tools (installer, partitioning, net).
+
+live-session:
+  user: artix
+  password: artix
+  autologin: true
+  use-xlibre: false
+  services:
+    - acpid
+    - metalog
+    - NetworkManager
+  user-services: []
+
+rootfs:
+  packages:
+    - mkinitcpio-nfs-utils
+    - networkmanager
+    - squashfs-tools
+  packages-init:
+    dinit:
+      - metalog-dinit
+      - networkmanager-dinit
+    openrc: []
+    runit: []
+    s6: []
+
+livefs:
+  packages:
+    - artix-grub-live
+    - artools-base
+    - artix-archlinux-support
+    - archlinux-keyring
+    - broadcom-wl
+    - curl
+    - dialog
+    - gptfdisk
+    - parted
+    - git
+    - rsync
+    - terminus-font
+    - wget
+    - neovim
+    # BlitzArt basic toolset (also installed on the target from the offline repo)
+    - eza
+    - ugrep
+    - tree
+    - fastfetch
+    - starship
+    - zsh
+    - zsh-syntax-highlighting
+    - zsh-autosuggestions
+    - zsh-history-substring-search
+    - fzf
+    - bat
+    - mcfly
+    - zoxide
+  packages-init:
+    dinit:
+      - artix-live-dinit
+    openrc: []
+    runit: []
+    s6: []

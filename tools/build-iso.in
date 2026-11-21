@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+# build-iso - one-file builder for BlitzArt Linux (Artix + dinit, btrfs/snapper/grub-btrfs)
+#
+# On an Artix machine with artools-iso installed:
+#       ./build-iso            # -> BlitzArt live ISO
+#
+# This single file carries the whole ISO profile, the installer (blitzinstall) and
+# `blitz`. At build time it fetches: nazwasadfh/dots, oh-my-zsh and (optionally) an
+# offline package repo so that the installer does not download the base/tools packages.
+set -euo pipefail
+
+readonly PROFILE=blitzart
+readonly INIT=dinit
+readonly DOTS_URL="${BLITZART_DOTS_URL:-https://github.com/nazwasadfh/dots}"
+readonly DOTS_DIR="${BLITZART_DOTS_DIR:-/tmp/blitzart-dots}"
+readonly OMZ_URL="https://github.com/ohmyzsh/ohmyzsh"
+readonly OMZ_DIR="/tmp/blitzart-omz"
+readonly STATE_DIR="/var/cache/blitzart-build"
+readonly MARK="# blitzart-managed"
+
+C=$'\e[36m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; B=$'\e[1m'; N=$'\e[0m'
+msg()  { printf '%s==>%s %s%s%s\n' "$G" "$N" "$B" "$*" "$N"; }
+info() { printf '%s  ->%s %s\n' "$C" "$N" "$*"; }
+warn() { printf '%s==> WARNING:%s %s\n' "$Y" "$N" "$*" >&2; }
+die()  { printf '%s==> ERROR:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+    cat <<EOF
+Usage: ./build-iso [options]
+
+  -q, --query            show what buildiso would do, build nothing
+  -n, --no-offline-repo  do not cache packages in the ISO (installer downloads everything)
+  -y, --yes              answer yes to prompts (move aside a foreign iso-profiles dir, ...)
+  -h, --help             this help
+
+Environment:
+  BLITZART_DOTS_URL      dots repository   (default: $DOTS_URL)
+  WORKSPACE_DIR          artools workspace (default: ~/artools-workspace)
+EOF
+}
+
+QUERY=0; OFFLINE=1; YES=0
+for a in "$@"; do
+    case $a in
+        -q|--query) QUERY=1 ;;
+        -n|--no-offline-repo) OFFLINE=0 ;;
+        -y|--yes) YES=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage; die "unknown option: $a" ;;
+    esac
+done
+
+# ------------------------------------------------------------------ privileges
+if [[ $EUID -ne 0 ]]; then
+    have sudo || die "run as root or install sudo"
+    exec sudo -E "$0" "$@"
+fi
+REAL_USER=${SUDO_USER:-root}
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+WORKSPACE=${WORKSPACE_DIR:-$REAL_HOME/artools-workspace}
+CONF_DIR=${XDG_CONFIG_HOME:-$REAL_HOME/.config}/artools
+[[ $REAL_USER != root ]] && CONF_DIR=$REAL_HOME/.config/artools
+
+ask() { ((YES)) && return 0; local a; read -r -p "$1 [y/N] " a || return 1; [[ $a =~ ^[Yy] ]]; }
+
+# ------------------------------------------------------------------ dependencies
+check_deps() {
+    msg "Checking build dependencies"
+    have pacman || die "this builder needs an Artix (or Arch based) host with pacman"
+    local missing=()
+    have buildiso || missing+=(artools-iso)
+    have git      || missing+=(git)
+    have curl     || missing+=(curl)
+    have tar      || missing+=(tar)
+    have repo-add || missing+=(pacman)
+    pacman -Qq artix-archlinux-support >/dev/null 2>&1 || missing+=(artix-archlinux-support)
+    pacman -Qq archlinux-keyring >/dev/null 2>&1       || missing+=(archlinux-keyring)
+    if ((${#missing[@]})); then
+        info "missing: ${missing[*]}"
+        ask "Install them with pacman now?" || die "install the missing packages and run again"
+        pacman -S --needed --noconfirm "${missing[@]}" || die "pacman failed"
+    fi
+    # the build chroot verifies Arch packages with the HOST keyring
+    if ! gpg --homedir /etc/pacman.d/gnupg --list-keys 2>/dev/null | grep -qi 'archlinux.org'; then
+        info "populating the Arch Linux keyring on the host"
+        pacman-key --init >/dev/null 2>&1 || true
+        pacman-key --populate archlinux || warn "pacman-key --populate archlinux failed"
+    fi
+    modprobe loop 2>/dev/null || true
+    [[ -f /etc/pacman.d/mirrorlist-arch ]] || die "/etc/pacman.d/mirrorlist-arch missing (artix-archlinux-support)"
+}
+
+# ------------------------------------------------------------------ payload / sources
+extract_payload() {
+    STAGE=$(mktemp -d /tmp/blitzart-stage.XXXXXX)
+    trap 'rm -rf "$STAGE"' EXIT
+    awk '/^__PAYLOAD__$/{f=1;next} f' "$0" | base64 -d | tar -xz -C "$STAGE" \
+        || die "cannot unpack the embedded payload (is this file truncated?)"
+    [[ -d $STAGE/profile/$PROFILE ]] || die "payload is missing the profile"
+}
+
+sync_repo() { # url dir label
+    local url=$1 dir=$2 label=$3
+    if [[ -d $dir/.git ]] && [[ $(git -C "$dir" remote get-url origin 2>/dev/null) == "$url" ]]; then
+        info "updating $label ($dir)"
+        git -C "$dir" fetch --depth 1 origin HEAD -q && git -C "$dir" reset --hard FETCH_HEAD -q \
+            && git -C "$dir" clean -fdxq || { warn "update failed, recloning"; rm -rf "$dir"; }
+    elif [[ -e $dir ]]; then
+        rm -rf "$dir"
+    fi
+    if [[ ! -d $dir/.git ]]; then
+        info "cloning $label"
+        git clone --depth 1 -q "$url" "$dir" || die "cannot clone $url"
+    fi
+    info "$label at $(git -C "$dir" rev-parse --short HEAD)"
+}
+
+# ------------------------------------------------------------------ pacman configs
+# $1 = file, $2 = SigLevel for the Artix/Arch repos
+write_pacman_conf() {
+    cat >"$1" <<EOF
+$MARK - generated by build-iso
+[options]
+HoldPkg      = pacman glibc
+Architecture = auto
+Color
+ILoveCandy
+CheckSpace
+VerbosePkgLists
+ParallelDownloads = 5
+SigLevel = $2
+LocalFileSigLevel = Optional
+
+[system]
+Include = /etc/pacman.d/mirrorlist
+
+[world]
+Include = /etc/pacman.d/mirrorlist
+
+[galaxy]
+Include = /etc/pacman.d/mirrorlist
+
+[extra]
+Include = /etc/pacman.d/mirrorlist-arch
+
+[multilib]
+Include = /etc/pacman.d/mirrorlist-arch
+EOF
+}
+
+install_artools_conf() {
+    msg "Configuring artools pacman repositories (artix + arch)"
+    local sysdir="" d f targets=() dst
+    # artools >= 0.2x: per-repo configs in pacman.conf.d/ (e.g. iso-x86_64.conf);
+    # older artools: a single pacman-default.conf. Override both so the right one wins.
+    for d in /usr/share/artools/pacman.conf.d /usr/share/artools/pacmanconf.d; do
+        [[ -d $d ]] && { sysdir=$d; break; }
+    done
+    if [[ -n $sysdir ]]; then
+        for f in "$sysdir"/iso-*.conf; do [[ -e $f ]] && targets+=("$(basename "$f")"); done
+    fi
+    ((${#targets[@]})) || targets=("iso-$(uname -m).conf")
+    info "artools configs: ${targets[*]} (system dir: ${sysdir:-not found})"
+
+    mkdir -p "$CONF_DIR/pacman.conf.d"
+    for f in "${targets[@]}"; do
+        dst=$CONF_DIR/pacman.conf.d/$f
+        if [[ -f $dst ]] && ! grep -q "^$MARK" "$dst"; then cp -n "$dst" "$dst.bak-blitzart" && info "backed up your $dst"; fi
+        write_pacman_conf "$dst" "Required DatabaseOptional"
+    done
+    dst=$CONF_DIR/pacman-default.conf
+    if [[ -f $dst ]] && ! grep -q "^$MARK" "$dst"; then cp -n "$dst" "$dst.bak-blitzart" && info "backed up your $dst"; fi
+    write_pacman_conf "$dst" "Required DatabaseOptional"
+    chown -R "$REAL_USER":"$(id -gn "$REAL_USER")" "$CONF_DIR" 2>/dev/null || true
+}
+
+# Sync a throw-away db with the same repos the ISO build uses and make sure every
+# package named in the profile exists - fails here in seconds instead of mid-build.
+sync_dl_db() {
+    mkdir -p "$STATE_DIR/pkgs" "$STATE_DIR/db/local"
+    write_pacman_conf "$STATE_DIR/pacman-dl.conf" "Required DatabaseOptional"
+    pacman --config "$STATE_DIR/pacman-dl.conf" --dbpath "$STATE_DIR/db" --logfile /dev/null --noconfirm -Sy >/dev/null \
+        || die "cannot sync package databases (mirrors / network?)"
+}
+
+profile_package_names() {
+    local f
+    for f in "$STAGE/profile/common/common.yaml" "$STAGE/profile/$PROFILE/profile.yaml"; do
+        awk '
+            /^[[:space:]]*#/ {next}
+            /^[[:space:]]*packages[a-z-]*:/ {on=1; next}
+            /^[[:space:]]*(dinit|openrc|runit|s6):/ {next}
+            /^[[:space:]]*[A-Za-z-]+:/ {on=0; next}
+            on && /^[[:space:]]*-[[:space:]]/ { sub(/^[[:space:]]*-[[:space:]]*/,""); sub(/[[:space:]]*#.*/,""); print }
+        ' "$f"
+    done | sort -u
+}
+
+check_package_names() {
+    local names out missing
+    msg "Verifying that every package in the profile exists in the configured repos"
+    sync_dl_db
+    mapfile -t names < <(profile_package_names)
+    out=$(pacman --config "$STATE_DIR/pacman-dl.conf" --dbpath "$STATE_DIR/db" --logfile /dev/null --noconfirm \
+          -Sp "${names[@]}" 2>&1 >/dev/null) || true
+    missing=$(grep -i 'target not found' <<<"$out" | sed 's/.*: //' | tr '\n' ' ')
+    [[ -z $missing ]] || die "packages not found in artix/arch repos: $missing(fix profile.yaml / common.yaml)"
+    info "${#names[@]} package names OK"
+}
+
+# ------------------------------------------------------------------ offline repo
+build_offline_repo() { # $1 = destination dir
+    local dest=$1 conf db pkgs urls f
+    # shellcheck disable=SC1091
+    . "$STAGE/profile/$PROFILE/live-overlay/usr/lib/blitzart/packages.sh"
+    mapfile -t pkgs < <(ba_all_offline_pkgs | sort -u)
+    msg "Caching ${#pkgs[@]} packages (+ dependencies) for the offline repo"
+
+    # signatures are downloaded and verified against the host keyring (artix + archlinux);
+    # the .sig files are shipped next to the packages so the installer verifies them again
+    sync_dl_db
+    conf=$STATE_DIR/pacman-dl.conf
+    db=$STATE_DIR/db
+    mapfile -t urls < <(pacman --config "$conf" --dbpath "$db" --logfile /dev/null --noconfirm -Sp "${pkgs[@]}" 2>/dev/null | grep -E '^(https?|file)://')
+    ((${#urls[@]})) || die "could not resolve the package set (a package name changed?)"
+    pacman --config "$conf" --dbpath "$db" --cachedir "$STATE_DIR/pkgs" --logfile /dev/null \
+        --noconfirm -Sw "${pkgs[@]}" || die "package download failed"
+
+    mkdir -p "$dest"
+    for f in "${urls[@]}"; do
+        f=$(basename "$f")
+        [[ -f $STATE_DIR/pkgs/$f ]]     || die "expected $f in the cache"
+        [[ -f $STATE_DIR/pkgs/$f.sig ]] || die "missing signature for $f (refusing to build an unsigned repo)"
+        cp -al --reflink=auto "$STATE_DIR/pkgs/$f" "$dest/$f" 2>/dev/null || cp "$STATE_DIR/pkgs/$f" "$dest/$f"
+        cp -al --reflink=auto "$STATE_DIR/pkgs/$f.sig" "$dest/$f.sig" 2>/dev/null || cp "$STATE_DIR/pkgs/$f.sig" "$dest/$f.sig"
+    done
+    find "$dest" -maxdepth 1 -name '*.pkg.tar.*' ! -name '*.sig' -print0 \
+        | xargs -0 repo-add -q "$dest/blitzart-local.db.tar.zst" >/dev/null
+    info "offline repo: $(find "$dest" -maxdepth 1 -name '*.pkg.tar.*' ! -name '*.sig' | wc -l) signed packages, $(du -sh "$dest" | cut -f1)"
+}
+
+# ------------------------------------------------------------------ profile staging
+stage_profile() {
+    local iso_profiles=$WORKSPACE/iso-profiles
+    msg "Staging the profile in $iso_profiles"
+    mkdir -p "$WORKSPACE"
+    if [[ -e $iso_profiles && ! -e $iso_profiles/.blitzart ]]; then
+        warn "$iso_profiles exists and is not managed by build-iso"
+        ask "Move it to $iso_profiles.bak-$(date +%s) and continue?" || die "aborted"
+        mv "$iso_profiles" "$iso_profiles.bak-$(date +%s)"
+    fi
+    rm -rf "$iso_profiles"
+    mkdir -p "$iso_profiles"
+    : >"$iso_profiles/.blitzart"
+    cp -a "$STAGE/profile/common" "$iso_profiles/common"
+    cp -a "$STAGE/profile/$PROFILE" "$iso_profiles/$PROFILE"
+
+    local lo=$iso_profiles/$PROFILE/live-overlay
+    # installer + toolbox
+    install -Dm755 "$STAGE/data/blitz" "$lo/usr/local/bin/blitz"
+
+    # dots (fastfetch, kitty, starship.toml, .zshrc) -> /usr/share/blitzart/dots
+    local d=$lo/usr/share/blitzart/dots
+    mkdir -p "$d"
+    local item
+    for item in fastfetch kitty starship.toml .zshrc; do
+        if [[ -e $DOTS_DIR/$item ]]; then cp -a "$DOTS_DIR/$item" "$d/"; else warn "dots repo has no '$item'"; fi
+    done
+    # oh-my-zsh -> /usr/share/blitzart/oh-my-zsh (no .git)
+    mkdir -p "$lo/usr/share/blitzart/oh-my-zsh"
+    (cd "$OMZ_DIR" && tar --exclude=.git -cf - .) | tar -xf - -C "$lo/usr/share/blitzart/oh-my-zsh"
+
+    # live user's skel: same dots, so the tty session looks like the installed system
+    local skel=$lo/etc/skel
+    mkdir -p "$skel/.config"
+    [[ -d $d/fastfetch ]]     && cp -a "$d/fastfetch" "$skel/.config/"
+    [[ -d $d/kitty ]]         && cp -a "$d/kitty" "$skel/.config/"
+    [[ -f $d/starship.toml ]] && cp -a "$d/starship.toml" "$skel/.config/"
+    [[ -f $d/.zshrc ]]        && cp -a "$d/.zshrc" "$skel/.zshrc"
+
+    if ((OFFLINE && !QUERY)); then
+        build_offline_repo "$lo/opt/blitzart/repo"
+    fi
+    chown -R "$REAL_USER":"$(id -gn "$REAL_USER")" "$WORKSPACE" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------ main
+main() {
+    check_deps
+    extract_payload
+    sync_repo "$DOTS_URL" "$DOTS_DIR" "dots"
+    sync_repo "$OMZ_URL" "$OMZ_DIR" "oh-my-zsh"
+    install_artools_conf
+    check_package_names
+    stage_profile
+
+    if ((QUERY)); then
+        msg "Query mode: buildiso -p $PROFILE -i $INIT -q"
+        buildiso -p "$PROFILE" -i "$INIT" -q || true
+        return 0
+    fi
+    msg "Building BlitzArt ISO (buildiso -p $PROFILE -i $INIT)"
+    buildiso -p "$PROFILE" -i "$INIT"
+
+    local iso
+    iso=$(find "$WORKSPACE/iso" /var/lib/artools/iso "$REAL_HOME/artools-workspace/iso" -name '*.iso' -newer "$STAGE" 2>/dev/null | sort | tail -n1 || true)
+    if [[ -n $iso ]]; then msg "Done: $iso"; else msg "Build finished - look for the ISO under $WORKSPACE/iso or /var/lib/artools/iso"; fi
+}
+
+main "$@"
+exit 0
+__PAYLOAD__

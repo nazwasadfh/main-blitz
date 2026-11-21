@@ -1,0 +1,4 @@
+# grub-btrfsd: regenerate grub snapshot entries when /.snapshots changes
+type    = process
+command = /usr/local/bin/blitzart-grub-btrfsd
+restart = true

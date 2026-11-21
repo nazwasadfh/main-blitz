@@ -1,0 +1,12 @@
+#!/bin/bash
+# Brand os-release as BlitzArt (ID stays "artix", ID_LIKE=arch). Idempotent.
+set_kv() { # file key value
+    if grep -q "^$2=" "$1"; then sed -i "s|^$2=.*|$2=$3|" "$1"; else printf '%s=%s\n' "$2" "$3" >>"$1"; fi
+}
+for f in "$(readlink -f /etc/os-release)" /usr/lib/os-release; do
+    [[ -f $f && ! -L $f ]] || continue
+    set_kv "$f" NAME '"BlitzArt"'
+    set_kv "$f" PRETTY_NAME '"BlitzArt"'
+    set_kv "$f" ID_LIKE arch
+done
+exit 0

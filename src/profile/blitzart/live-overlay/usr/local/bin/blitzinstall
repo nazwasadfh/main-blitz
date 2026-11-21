@@ -1,0 +1,501 @@
+#!/usr/bin/env bash
+# blitzinstall - BlitzArt Linux installer (inspired by archinstall)
+# UEFI + GPT only | btrfs (@, @snapshots, @pkg) | GRUB + grub-btrfs | dinit
+set -uo pipefail
+
+readonly VERSION="0.1.0"
+readonly MNT=/mnt
+readonly LOG=/var/log/blitzinstall.log
+readonly SHARE=/usr/share/blitzart
+readonly REPO_DIR=/opt/blitzart/repo
+readonly TITLE="BlitzArt installer $VERSION"
+readonly BTRFS_OPTS="noatime,compress=zstd:3,space_cache=v2"
+
+# shellcheck disable=SC1091
+. /usr/lib/blitzart/packages.sh
+# shellcheck disable=SC1091
+. /usr/lib/blitzart/dots.sh
+
+# ---------------------------------------------------------------- state
+HOSTNAME_V="blitzart"
+DISK=""; PART_MODE="auto"; ESP_PART=""; ROOT_PART=""; FORMAT_ESP=1
+KERNELS=(linux)
+ROOT_PW=""; USER_NAME=""; USER_PW=""
+TZ_V="UTC"; LOCALE_V="en_US.UTF-8"; KEYMAP_V="us"
+EXTRA_PKGS=""
+
+# ---------------------------------------------------------------- helpers
+C=$'\e[36m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; B=$'\e[1m'; N=$'\e[0m'
+msg()  { printf '%s==>%s %s%s%s\n' "$G" "$N" "$B" "$*" "$N"; }
+info() { printf '%s  ->%s %s\n' "$C" "$N" "$*"; }
+warn() { printf '%s==> WARNING:%s %s\n' "$Y" "$N" "$*" >&2; }
+die()  { printf '%s==> ERROR:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+[[ $EUID -eq 0 ]] || { have sudo && exec sudo -E "$0" "$@"; die "Run as root."; }
+have dialog || die "dialog is missing."
+
+DLG() { dialog --backtitle "$TITLE" "$@"; }
+msgbox() { DLG --title "${2:-BlitzArt}" --msgbox "$1" 12 66; }
+yesno()  { DLG --title "${2:-Confirm}" --defaultno --yesno "$1" 12 66; }
+input()  { DLG --stdout --title "$1" --inputbox "$2" 10 66 "${3:-}"; }
+password() { # prompt twice, echo result
+    local a b
+    while :; do
+        a=$(DLG --stdout --title "$1" --insecure --passwordbox "Password:" 9 60) || return 1
+        [[ -n $a ]] || { msgbox "Password cannot be empty."; continue; }
+        b=$(DLG --stdout --title "$1" --insecure --passwordbox "Repeat password:" 9 60) || return 1
+        [[ $a == "$b" ]] && { printf '%s' "$a"; return 0; }
+        msgbox "Passwords do not match."
+    done
+}
+part() { [[ $1 =~ [0-9]$ ]] && echo "${1}p$2" || echo "${1}$2"; }
+ach()  { artix-chroot "$MNT" "$@"; }
+
+# ---------------------------------------------------------------- preflight
+preflight() {
+    [[ -d /sys/firmware/efi/efivars ]] || { clear; die "Not booted in UEFI mode. BlitzArt requires UEFI + GPT."; }
+}
+
+have_net() {
+    getent hosts artixlinux.org >/dev/null 2>&1 && curl -fsS -m 8 -o /dev/null https://artixlinux.org
+}
+
+ensure_net() {
+    while ! have_net; do
+        DLG --title "Network required" --menu "No internet connection.\nBlitzArt installs from the network." 12 62 3 \
+            1 "Configure network (nmtui)" \
+            2 "Retry" \
+            3 "Abort" 2>/tmp/.ba_net || { clear; exit 1; }
+        case $(</tmp/.ba_net) in
+            1) nmtui ;;
+            2) ;;
+            3) clear; exit 1 ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------- menu pickers
+pick_disk() {
+    local items=() n s m
+    while read -r n s m; do items+=("$n" "$s ${m:-}"); done < <(lsblk -dpno NAME,SIZE,MODEL -e 7,11,252 | sed 's/  */ /')
+    ((${#items[@]})) || { msgbox "No disks found."; return 1; }
+    DLG --stdout --title "Disk" --menu "Select the installation disk:" 18 70 8 "${items[@]}"
+}
+
+pick_part() { # $1 = disk, $2 = prompt
+    local items=() n s f
+    while read -r n s f; do items+=("$n" "$s ${f:--}"); done < <(lsblk -pnlo NAME,SIZE,FSTYPE "$1" | tail -n +2)
+    ((${#items[@]})) || { msgbox "No partitions on $1."; return 1; }
+    DLG --stdout --title "Partition" --menu "$2" 18 70 8 "${items[@]}"
+}
+
+cfg_disk() {
+    local d mode
+    mode=$(DLG --stdout --title "Disk configuration" --menu "Layout: GPT, 1G ESP (/boot/efi) + btrfs root.\nNo separate /home." 13 66 2 \
+        auto   "Wipe the whole disk and partition automatically" \
+        manual "Use existing GPT partitions") || return
+    d=$(pick_disk) || return
+    if [[ $mode == manual ]]; then
+        if [[ $(lsblk -dno PTTYPE "$d") != gpt ]]; then
+            msgbox "$d does not have a GPT partition table.\nBlitzArt requires GPT. Use automatic mode or convert the disk first."
+            return
+        fi
+        yesno "Edit partitions with cfdisk first?" "Partitioning" && cfdisk "$d"
+        ESP_PART=$(pick_part "$d" "Select the EFI System Partition (ESP):") || return
+        ROOT_PART=$(pick_part "$d" "Select the partition for the btrfs ROOT (will be formatted):") || return
+        [[ $ESP_PART != "$ROOT_PART" ]] || { msgbox "ESP and root must differ."; return; }
+        if [[ $(lsblk -no FSTYPE "$ESP_PART") == vfat ]] && ! yesno "Format the existing ESP $ESP_PART?\n(No = keep it, e.g. for dual-boot)" "ESP"; then
+            FORMAT_ESP=0
+        else
+            FORMAT_ESP=1
+        fi
+    else
+        ESP_PART=""; ROOT_PART=""; FORMAT_ESP=1
+    fi
+    DISK=$d; PART_MODE=$mode
+}
+
+cfg_kernels() {
+    local sel
+    sel=$(DLG --stdout --title "Kernels" --checklist "Select kernel(s) (space = toggle):" 13 60 4 \
+        linux     "Mainline (default)"   "$([[ " ${KERNELS[*]} " == *" linux "* ]] && echo on || echo off)" \
+        linux-lts "Long term support"    "$([[ " ${KERNELS[*]} " == *" linux-lts "* ]] && echo on || echo off)" \
+        linux-zen "Zen (desktop tuned)"  "$([[ " ${KERNELS[*]} " == *" linux-zen "* ]] && echo on || echo off)") || return
+    # shellcheck disable=SC2206
+    sel=(${sel//\"/})
+    ((${#sel[@]})) || { msgbox "Select at least one kernel."; return; }
+    KERNELS=("${sel[@]}")
+}
+
+cfg_timezone() {
+    local regions=() r cities=() c
+    while read -r r; do regions+=("$r" ""); done < <(find /usr/share/zoneinfo -mindepth 1 -maxdepth 1 -type d \
+        ! -name posix ! -name right ! -name Etc -printf '%f\n' | sort)
+    r=$(DLG --stdout --title "Timezone" --menu "Region:" 20 50 12 "${regions[@]}" UTC "") || return
+    if [[ $r == UTC ]]; then TZ_V=UTC; return; fi
+    while read -r c; do cities+=("$c" ""); done < <(find "/usr/share/zoneinfo/$r" -type f -printf '%P\n' | sort)
+    c=$(DLG --stdout --title "Timezone" --menu "City:" 20 50 12 "${cities[@]}") || return
+    TZ_V="$r/$c"
+}
+
+cfg_locale() {
+    local l k
+    l=$(input "Locale" "Locale (must exist in /etc/locale.gen):" "$LOCALE_V") || return
+    grep -qE "^#?${l//./\\.} " /etc/locale.gen || { msgbox "Unknown locale: $l"; return; }
+    k=$(input "Keymap" "Console keymap (e.g. us, pl, de-latin1):" "$KEYMAP_V") || return
+    find /usr/share/kbd/keymaps -name "$k.map*" 2>/dev/null | grep -q . || { msgbox "Unknown keymap: $k"; return; }
+    LOCALE_V=$l; KEYMAP_V=$k
+    loadkeys "$k" 2>/dev/null || true
+}
+
+cfg_user() {
+    local u p
+    u=$(input "User account" "Username (lowercase):" "$USER_NAME") || return
+    [[ $u =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { msgbox "Invalid username."; return; }
+    [[ $u != root ]] || { msgbox "Pick a regular user (root is configured separately)."; return; }
+    p=$(password "Password for $u") || return
+    USER_NAME=$u; USER_PW=$p
+}
+
+# ---------------------------------------------------------------- main menu
+status() { [[ -n $1 ]] && echo "$1" || echo "(not set)"; }
+
+main_menu() {
+    local choice disk_s
+    while :; do
+        if [[ -z $DISK ]]; then disk_s="(not set)"
+        elif [[ $PART_MODE == auto ]]; then disk_s="auto: $DISK"
+        else disk_s="manual: $ESP_PART + $ROOT_PART"; fi
+        choice=$(DLG --stdout --title "BlitzArt Linux" --cancel-label "Abort" --menu \
+            "Configure the installation, then choose Install." 22 72 10 \
+            1 "Hostname              [$HOSTNAME_V]" \
+            2 "Disk configuration    [$disk_s]" \
+            3 "Kernels               [${KERNELS[*]}]" \
+            4 "Root password         [$([[ -n $ROOT_PW ]] && echo set || echo '(not set)')]" \
+            5 "User account          [$(status "$USER_NAME")]" \
+            6 "Timezone              [$TZ_V]" \
+            7 "Locale / keymap       [$LOCALE_V / $KEYMAP_V]" \
+            8 "Additional packages   [${EXTRA_PKGS:-none}]" \
+            9 ">> Install" \
+            0 "Abort") || { clear; exit 0; }
+        case $choice in
+            1) local h; h=$(input "Hostname" "Hostname:" "$HOSTNAME_V") && [[ $h =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] && HOSTNAME_V=$h ;;
+            2) cfg_disk ;;
+            3) cfg_kernels ;;
+            4) ROOT_PW=$(password "Root password") || true ;;
+            5) cfg_user ;;
+            6) cfg_timezone ;;
+            7) cfg_locale ;;
+            8) EXTRA_PKGS=$(input "Additional packages" "Extra packages (space separated, from any enabled repo):" "$EXTRA_PKGS") || true ;;
+            9) validate && return 0 ;;
+            0) clear; exit 0 ;;
+        esac
+    done
+}
+
+validate() {
+    local miss=()
+    [[ -n $DISK ]]      || miss+=("disk")
+    [[ -n $ROOT_PW ]]   || miss+=("root password")
+    [[ -n $USER_NAME ]] || miss+=("user account")
+    if ((${#miss[@]})); then msgbox "Still missing: ${miss[*]}"; return 1; fi
+    local summary="Disk:     $DISK ($PART_MODE)\nHostname: $HOSTNAME_V\nKernels:  ${KERNELS[*]}\nUser:     $USER_NAME\nTimezone: $TZ_V\nLocale:   $LOCALE_V / $KEYMAP_V"
+    if [[ $PART_MODE == auto ]]; then
+        summary+="\n\n!! ALL DATA ON $DISK WILL BE DESTROYED (blkdiscard + new GPT) !!"
+    else
+        summary+="\n\n!! $ROOT_PART WILL BE FORMATTED !!"
+    fi
+    yesno "$summary\n\nProceed?" "Final confirmation"
+}
+
+# ---------------------------------------------------------------- install phases
+phase_disk() {
+    msg "Preparing disk"
+    umount -R "$MNT" 2>/dev/null || true
+    swapoff -a 2>/dev/null || true
+    if [[ $PART_MODE == auto ]]; then
+        info "blkdiscard -fv $DISK"
+        blkdiscard -fv "$DISK" || warn "blkdiscard failed or unsupported - continuing"
+        sgdisk --zap-all "$DISK" >/dev/null
+        sgdisk -n1:0:+1G -t1:EF00 -c1:ESP \
+               -n2:0:0   -t2:8300 -c2:BlitzArt "$DISK" || die "partitioning failed"
+        partprobe "$DISK"; udevadm settle
+        ESP_PART=$(part "$DISK" 1); ROOT_PART=$(part "$DISK" 2)
+        FORMAT_ESP=1
+    fi
+    ((FORMAT_ESP)) && { info "mkfs.fat $ESP_PART"; mkfs.fat -F32 -n ESP "$ESP_PART" || die "mkfs.fat failed"; }
+    info "mkfs.btrfs $ROOT_PART"
+    mkfs.btrfs -f -L BLITZART "$ROOT_PART" || die "mkfs.btrfs failed"
+
+    mkdir -p "$MNT"
+    mount "$ROOT_PART" "$MNT" || die "mount failed"
+    local sv
+    for sv in @ @snapshots @pkg; do btrfs subvolume create "$MNT/$sv" || die "subvolume $sv failed"; done
+    umount "$MNT"
+
+    mount -o "$BTRFS_OPTS,subvol=@" "$ROOT_PART" "$MNT"
+    mkdir -p "$MNT/boot/efi" "$MNT/.snapshots" "$MNT/var/cache/pacman/pkg"
+    mount -o "$BTRFS_OPTS,subvol=@snapshots" "$ROOT_PART" "$MNT/.snapshots"
+    mount -o "$BTRFS_OPTS,subvol=@pkg"       "$ROOT_PART" "$MNT/var/cache/pacman/pkg"
+    mount "$ESP_PART" "$MNT/boot/efi" || die "cannot mount ESP"
+    chmod 750 "$MNT/.snapshots"
+}
+
+write_install_conf() { # pacman.conf used by basestrap: local repo first, then artix + arch
+    local f=$1
+    {
+        cat <<'EOF'
+[options]
+HoldPkg      = pacman glibc
+Architecture = auto
+Color
+ILoveCandy
+CheckSpace
+VerbosePkgLists
+ParallelDownloads = 5
+SigLevel = Required DatabaseOptional
+LocalFileSigLevel = Optional
+
+EOF
+        if [[ -f $REPO_DIR/blitzart-local.db.tar.zst || -f $REPO_DIR/blitzart-local.db ]]; then
+            printf '[blitzart-local]\nSigLevel = Required DatabaseOptional\nServer = file://%s\n\n' "$REPO_DIR"
+        fi
+        cat <<'EOF'
+[system]
+Include = /etc/pacman.d/mirrorlist
+
+[world]
+Include = /etc/pacman.d/mirrorlist
+
+[galaxy]
+Include = /etc/pacman.d/mirrorlist
+
+[extra]
+Include = /etc/pacman.d/mirrorlist-arch
+
+[multilib]
+Include = /etc/pacman.d/mirrorlist-arch
+EOF
+    } >"$f"
+}
+
+phase_base() {
+    msg "Preparing keyrings"
+    pacman-key --init >/dev/null 2>&1 || true
+    pacman-key --populate artix archlinux >/dev/null 2>&1 || warn "keyring populate reported problems"
+
+    local conf=/tmp/blitzart-pacman.conf
+    write_install_conf "$conf"
+    local pkgs=("${BA_BASE_PKGS[@]}" "${BA_TOOLS_PKGS[@]}" "${KERNELS[@]}")
+    # shellcheck disable=SC2206
+    pkgs+=($EXTRA_PKGS)
+    msg "Installing base system (${#pkgs[@]} packages)"
+    basestrap -C "$conf" "$MNT" "${pkgs[@]}" || die "basestrap failed"
+
+    msg "Generating fstab"
+    fstabgen -U "$MNT" >"$MNT/etc/fstab"
+    # root must NOT carry subvol=/subvolid= so that booting a snapshot (rootflags=...) works
+    awk 'BEGIN{OFS="\t"} $2=="/" && $3=="btrfs" { n=split($4,o,","); s=""; for(i=1;i<=n;i++) if (o[i] !~ /^subvol(id)?=/) s=s (s?",":"") o[i]; $4=s } {print}' \
+        "$MNT/etc/fstab" >"$MNT/etc/fstab.new" && mv "$MNT/etc/fstab.new" "$MNT/etc/fstab"
+}
+
+enable_svc() {
+    local s=$1
+    if [[ -e $MNT/etc/dinit.d/$s ]]; then
+        mkdir -p "$MNT/etc/dinit.d/boot.d"
+        ln -sf "../$s" "$MNT/etc/dinit.d/boot.d/$s"
+        info "enabled service: $s"
+    else
+        warn "service '$s' not found in /etc/dinit.d - skipped"
+    fi
+}
+
+phase_configure() {
+    msg "Configuring system"
+    # --- pacman.conf (final): artix + arch + chaotic-aur + blackarch
+    install -Dm644 /etc/pacman.d/mirrorlist "$MNT/etc/pacman.d/mirrorlist" 2>/dev/null || true
+    [[ -f /etc/pacman.d/mirrorlist-arch ]] && install -Dm644 /etc/pacman.d/mirrorlist-arch "$MNT/etc/pacman.d/mirrorlist-arch"
+    cat >"$MNT/etc/pacman.conf" <<'EOF'
+[options]
+HoldPkg      = pacman glibc
+Architecture = auto
+Color
+ILoveCandy
+CheckSpace
+VerbosePkgLists
+ParallelDownloads = 5
+SigLevel = Required DatabaseOptional
+LocalFileSigLevel = Optional
+
+[system]
+Include = /etc/pacman.d/mirrorlist
+
+[world]
+Include = /etc/pacman.d/mirrorlist
+
+[galaxy]
+Include = /etc/pacman.d/mirrorlist
+
+[extra]
+Include = /etc/pacman.d/mirrorlist-arch
+
+[multilib]
+Include = /etc/pacman.d/mirrorlist-arch
+EOF
+
+    # --- identity
+    echo "$HOSTNAME_V" >"$MNT/etc/hostname"
+    cat >"$MNT/etc/hosts" <<EOF
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   $HOSTNAME_V.localdomain $HOSTNAME_V
+EOF
+    ln -sf "/usr/share/zoneinfo/$TZ_V" "$MNT/etc/localtime"
+    ach hwclock --systohc 2>/dev/null || true
+    sed -i -E "s/^#(${LOCALE_V//./\\.} )/\1/; s/^#(en_US\.UTF-8 )/\1/" "$MNT/etc/locale.gen"
+    ach locale-gen >/dev/null
+    echo "LANG=$LOCALE_V" >"$MNT/etc/locale.conf"
+    echo "KEYMAP=$KEYMAP_V" >"$MNT/etc/vconsole.conf"
+
+    # --- branding
+    install -Dm755 "$SHARE/blitzart-brand" "$MNT/usr/local/bin/blitzart-brand"
+    install -Dm644 "$SHARE/blitzart-os-release.hook" "$MNT/etc/pacman.d/hooks/blitzart-os-release.hook"
+    ach /usr/local/bin/blitzart-brand
+    printf '\n  BlitzArt\n\n' >"$MNT/etc/motd"
+
+    # --- users
+    msg "Creating users"
+    echo "root:$ROOT_PW" | ach chpasswd
+    ach useradd -m -G wheel,audio,video,storage,input,optical -s /usr/bin/zsh "$USER_NAME" || die "useradd failed"
+    echo "$USER_NAME:$USER_PW" | ach chpasswd
+    install -Dm440 /dev/stdin "$MNT/etc/sudoers.d/10-wheel" <<<'%wheel ALL=(ALL:ALL) ALL'
+    ach chsh -s /usr/bin/zsh root
+
+    # --- dots (from the ISO, no download)
+    msg "Copying configs"
+    blitzart_apply_dots "$MNT/etc/skel"
+    blitzart_apply_dots "$MNT/root"
+    blitzart_apply_dots "$MNT/home/$USER_NAME"
+    ach chown -R "$USER_NAME:$USER_NAME" "/home/$USER_NAME"
+
+    # --- blitz toolbox
+    install -Dm755 /usr/local/bin/blitz "$MNT/usr/local/bin/blitz"
+
+    # --- snapper (config name 'root', as blitz expects) + cleanup
+    msg "Configuring snapper / grub-btrfs"
+    install -Dm644 "$MNT/usr/share/snapper/config-templates/default" "$MNT/etc/snapper/configs/root"
+    sed -i -E \
+        -e 's|^SUBVOLUME=.*|SUBVOLUME="/"|' \
+        -e 's|^FSTYPE=.*|FSTYPE="btrfs"|' \
+        -e 's|^QGROUP=.*|QGROUP=""|' \
+        -e 's|^ALLOW_GROUPS=.*|ALLOW_GROUPS="wheel"|' \
+        -e 's|^SYNC_ACL=.*|SYNC_ACL="yes"|' \
+        -e 's|^TIMELINE_CREATE=.*|TIMELINE_CREATE="no"|' \
+        -e 's|^NUMBER_CLEANUP=.*|NUMBER_CLEANUP="yes"|' \
+        -e 's|^NUMBER_LIMIT=.*|NUMBER_LIMIT="20"|' \
+        -e 's|^NUMBER_LIMIT_IMPORTANT=.*|NUMBER_LIMIT_IMPORTANT="10"|' \
+        "$MNT/etc/snapper/configs/root"
+    mkdir -p "$MNT/etc/conf.d"
+    echo 'SNAPPER_CONFIGS="root"' >"$MNT/etc/conf.d/snapper"
+    mkdir -p "$MNT/etc/cron.daily"
+    printf '#!/bin/sh\nsnapper --no-dbus -c root cleanup number >/dev/null 2>&1\n' >"$MNT/etc/cron.daily/snapper-cleanup"
+    chmod 755 "$MNT/etc/cron.daily/snapper-cleanup"
+
+    install -Dm755 "$SHARE/blitzart-grub-btrfsd" "$MNT/usr/local/bin/blitzart-grub-btrfsd"
+    install -Dm644 "$SHARE/grub-btrfsd.dinit" "$MNT/etc/dinit.d/grub-btrfsd"
+
+    # --- services
+    local s
+    for s in dbus elogind NetworkManager acpid cronie grub-btrfsd; do enable_svc "$s"; done
+}
+
+phase_repos() { # chaotic-aur + blackarch (network), then paru
+    msg "Adding chaotic-aur and blackarch"
+    ach pacman-key --init >/dev/null 2>&1
+    ach pacman-key --populate artix archlinux >/dev/null 2>&1
+
+    # chaotic-aur
+    if ach pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com \
+       && ach pacman-key --lsign-key 3056513887B78AEB \
+       && ach pacman -U --noconfirm \
+            https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst \
+            https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst; then
+        printf '\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist\n' >>"$MNT/etc/pacman.conf"
+    else
+        warn "chaotic-aur setup failed - add it later"
+    fi
+
+    # blackarch
+    local ba_fpr=4345771566D76038C7FEB43863EC0ADBEA87E4E3
+    if ach pacman-key --recv-key "$ba_fpr" --keyserver keyserver.ubuntu.com \
+       && ach pacman-key --lsign-key "$ba_fpr"; then
+        cat >"$MNT/etc/pacman.d/blackarch-mirrorlist" <<'EOF'
+Server = https://blackarch.org/blackarch/$repo/os/$arch
+EOF
+        printf '\n[blackarch]\nSigLevel = Optional TrustAll\nInclude = /etc/pacman.d/blackarch-mirrorlist\n' >>"$MNT/etc/pacman.conf"
+    else
+        warn "blackarch setup failed - add it later"
+    fi
+
+    ach pacman -Sy --noconfirm || warn "pacman -Sy failed"
+    if grep -q '^\[chaotic-aur\]' "$MNT/etc/pacman.conf"; then
+        ach pacman -S --noconfirm --needed paru || warn "paru not installed"
+    fi
+}
+
+phase_boot() {
+    msg "Installing GRUB"
+    local g="$MNT/etc/default/grub"
+    sed -i -E \
+        -e 's|^GRUB_DISTRIBUTOR=.*|GRUB_DISTRIBUTOR="BlitzArt"|' \
+        -e 's|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 quiet"|' \
+        -e 's|^#?GRUB_DISABLE_OS_PROBER=.*|GRUB_DISABLE_OS_PROBER=true|' "$g"
+    grep -q '^GRUB_DISTRIBUTOR=' "$g" || echo 'GRUB_DISTRIBUTOR="BlitzArt"' >>"$g"
+    grep -q '^GRUB_DISABLE_OS_PROBER=' "$g" || echo 'GRUB_DISABLE_OS_PROBER=true' >>"$g"
+
+    ach mkinitcpio -P >/dev/null 2>&1 || warn "mkinitcpio -P reported problems"
+    ach grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=BlitzArt --recheck \
+        || { warn "NVRAM entry failed, installing to the removable path"; \
+             ach grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --recheck || die "grub-install failed"; }
+
+    msg "Creating baseline snapshot"
+    ach snapper --no-dbus -c root create -t single -c number -d "BlitzArt fresh install" \
+        || warn "could not create the baseline snapshot"
+
+    ach grub-mkconfig -o /boot/grub/grub.cfg || die "grub-mkconfig failed"
+}
+
+do_install() {
+    phase_disk
+    phase_base
+    phase_configure
+    phase_repos
+    phase_boot
+    sync
+    msg "Installation finished"
+}
+
+# ---------------------------------------------------------------- main
+case "${1:-}" in
+    -h|--help) echo "Usage: blitzinstall   (interactive installer for BlitzArt Linux)"; exit 0 ;;
+    -V|--version) echo "blitzinstall $VERSION"; exit 0 ;;
+esac
+
+preflight
+ensure_net
+main_menu
+clear
+mkdir -p "$(dirname "$LOG")"
+set -o pipefail
+do_install 2>&1 | tee -a "$LOG"
+rc=${PIPESTATUS[0]}
+if ((rc != 0)); then
+    echo; warn "Installation FAILED (log: $LOG). The target is still mounted at $MNT."
+    exit "$rc"
+fi
+umount -R "$MNT" 2>/dev/null || true
+if yesno "BlitzArt is installed.\nReboot now? (remove the installation medium)" "Done"; then
+    clear; reboot
+fi
+clear
