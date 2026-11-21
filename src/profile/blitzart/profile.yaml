@@ -36,7 +36,6 @@ livefs:
     - artools-base
     - artix-archlinux-support
     - archlinux-keyring
-    - broadcom-wl
     - curl
     - dialog
     - gptfdisk
