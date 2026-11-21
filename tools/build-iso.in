@@ -269,11 +269,11 @@ stage_profile() {
     # installer + toolbox
     install -Dm755 "$STAGE/data/blitz" "$lo/usr/local/bin/blitz"
 
-    # dots (fastfetch, kitty, starship.toml, .zshrc) -> /usr/share/blitzart/dots
+    # dots (fastfetch, eza, kitty, starship.toml, .zshrc) -> /usr/share/blitzart/dots
     local d=$lo/usr/share/blitzart/dots
     mkdir -p "$d"
     local item
-    for item in fastfetch kitty starship.toml .zshrc; do
+    for item in fastfetch eza kitty starship.toml .zshrc; do
         if [[ -e $DOTS_DIR/$item ]]; then cp -a "$DOTS_DIR/$item" "$d/"; else warn "dots repo has no '$item'"; fi
     done
     # oh-my-zsh -> /usr/share/blitzart/oh-my-zsh (no .git)
@@ -284,6 +284,7 @@ stage_profile() {
     local skel=$lo/etc/skel
     mkdir -p "$skel/.config"
     [[ -d $d/fastfetch ]]     && cp -a "$d/fastfetch" "$skel/.config/"
+    [[ -d $d/eza ]]           && cp -a "$d/eza" "$skel/.config/"
     [[ -d $d/kitty ]]         && cp -a "$d/kitty" "$skel/.config/"
     [[ -f $d/starship.toml ]] && cp -a "$d/starship.toml" "$skel/.config/"
     [[ -f $d/.zshrc ]]        && cp -a "$d/.zshrc" "$skel/.zshrc"

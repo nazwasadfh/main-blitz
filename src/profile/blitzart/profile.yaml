@@ -64,6 +64,8 @@ livefs:
     - bat
     - mcfly
     - zoxide
+    - ttf-victor-mono-nerd
+    - ttf-nerd-fonts-symbols
   packages-init:
     dinit:
       - artix-live-dinit

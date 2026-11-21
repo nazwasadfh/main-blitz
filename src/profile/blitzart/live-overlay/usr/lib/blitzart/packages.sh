@@ -5,6 +5,8 @@ BA_TOOLS_PKGS=(
     eza ugrep tree fastfetch git starship
     zsh zsh-syntax-highlighting zsh-autosuggestions zsh-history-substring-search
     fzf bat mcfly zoxide
+    # fonts: kitty config uses VictorMono Nerd Font Mono; symbols = fallback glyphs for any font
+    ttf-victor-mono-nerd ttf-nerd-fonts-symbols
     # used by aliases in the dots .zshrc
     expac hwinfo python-pygments pkgfile
 )

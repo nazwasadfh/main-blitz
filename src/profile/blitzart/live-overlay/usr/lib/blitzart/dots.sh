@@ -10,6 +10,7 @@ blitzart_apply_dots() {
     [[ -d $h ]] || mkdir -p "$h"
     mkdir -p "$h/.config"
     [[ -d $BA_DOTS/fastfetch ]]    && { rm -rf "$h/.config/fastfetch"; cp -r "$BA_DOTS/fastfetch" "$h/.config/fastfetch"; }
+    [[ -d $BA_DOTS/eza ]]          && { rm -rf "$h/.config/eza";       cp -r "$BA_DOTS/eza" "$h/.config/eza"; }
     [[ -d $BA_DOTS/kitty ]]        && { rm -rf "$h/.config/kitty";     cp -r "$BA_DOTS/kitty" "$h/.config/kitty"; }
     [[ -f $BA_DOTS/starship.toml ]] && cp "$BA_DOTS/starship.toml" "$h/.config/starship.toml"
     [[ -f $BA_DOTS/.zshrc ]]       && cp "$BA_DOTS/.zshrc" "$h/.zshrc"

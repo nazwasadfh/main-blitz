@@ -14,6 +14,8 @@ build-iso: clones/updates `nazwasadfh/dots` into /tmp/blitzart-dots (and oh-my-z
 stages the profile into `~/artools-workspace/iso-profiles`, writes `~/.config/artools/pacman.conf.d/iso-*.conf` (and the legacy `pacman-default.conf`)
 (artix + arch repos, ILoveCandy), checks that every profile package exists in those repos, and runs `buildiso -p blitzart -i dinit`.
 
+Dots copied from the repo: `fastfetch`, `eza`, `kitty` -> `~/.config/`, `starship.toml` -> `~/.config/starship.toml`, `.zshrc` -> `~/.zshrc`.
+
 ## Install layout
 
 - GPT + UEFI only: ESP 1G (`/boot/efi`) + btrfs root; no /home partition.
