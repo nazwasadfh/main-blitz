@@ -15,6 +15,7 @@ live-session:
     - acpid
     - metalog
     - NetworkManager
+    - dinit-user-spawn
   user-services: []
 
 rootfs:

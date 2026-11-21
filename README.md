@@ -37,6 +37,6 @@ Shown on the tty login prompt (/etc/issue), in /etc/motd and in a welcome box at
 
 ## User services (dinit)
 
-`dinit-user-spawn` is installed and enabled (live + installed system), so `dinitctl list` works as a normal
+`dinit-user-spawn` is installed and enabled (live via profile.yaml services, installed system via boot.d), so `dinitctl list` works as a normal
 user (user services in `~/.config/dinit.d`). turnstile is intentionally not used (it conflicts with elogind's
 rundir handling; the Artix wiki says not to run both).

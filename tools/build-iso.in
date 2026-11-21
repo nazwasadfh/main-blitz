@@ -288,6 +288,11 @@ stage_profile() {
     [[ -f $d/starship.toml ]] && cp -a "$d/starship.toml" "$skel/.config/"
     [[ -f $d/.zshrc ]]        && cp -a "$d/.zshrc" "$skel/.zshrc"
 
+    # artools copies overlays with symlinks dereferenced: a dangling link aborts the build
+    local dangling
+    dangling=$(find "$iso_profiles/$PROFILE" -xtype l 2>/dev/null) || true
+    [[ -z $dangling ]] || die "dangling symlinks in the profile (cp would fail): $dangling"
+
     if ((OFFLINE && !QUERY)); then
         build_offline_repo "$lo/opt/blitzart/repo"
     fi
