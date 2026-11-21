@@ -198,14 +198,23 @@ profile_package_names() {
 }
 
 check_package_names() {
-    local names out missing
+    local names out rc=0 missing
     msg "Verifying that every package in the profile exists in the configured repos"
     sync_dl_db
     mapfile -t names < <(profile_package_names)
+    ((${#names[@]})) || die "could not read any package names from the profile"
     out=$(pacman --config "$STATE_DIR/pacman-dl.conf" --dbpath "$STATE_DIR/db" --logfile /dev/null --noconfirm \
-          -Sp "${names[@]}" 2>&1 >/dev/null) || true
-    missing=$(grep -i 'target not found' <<<"$out" | sed 's/.*: //' | tr '\n' ' ')
-    [[ -z $missing ]] || die "packages not found in artix/arch repos: $missing(fix profile.yaml / common.yaml)"
+          -Sp "${names[@]}" 2>&1 >/dev/null) || rc=$?
+    # NOTE: grep exits 1 when nothing matches - must not abort under set -e/pipefail
+    missing=$(grep -i 'target not found' <<<"$out" | sed 's/.*: //' | tr '\n' ' ') || true
+    if [[ -n $missing ]]; then
+        die "packages not found in artix/arch repos: $missing- fix profile.yaml / common.yaml"
+    fi
+    if ((rc != 0)); then
+        warn "pacman could not fully resolve the package set (exit $rc):"
+        printf '%s\n' "$out" | tail -n 15 >&2
+        warn "continuing - the real build will show whether this matters"
+    fi
     info "${#names[@]} package names OK"
 }
 
