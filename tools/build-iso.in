@@ -85,7 +85,8 @@ check_deps() {
         pacman -S --needed --noconfirm "${missing[@]}" || die "pacman failed"
     fi
     # the build chroot verifies Arch packages with the HOST keyring
-    if ! gpg --homedir /etc/pacman.d/gnupg --list-keys 2>/dev/null | grep -qi 'archlinux.org'; then
+    # (no `| grep -q`: under pipefail the writer gets SIGPIPE and the pipeline is reported as failed)
+    if ! grep -qi 'archlinux.org' < <(gpg --homedir /etc/pacman.d/gnupg --list-keys 2>/dev/null); then
         info "populating the Arch Linux keyring on the host"
         pacman-key --init >/dev/null 2>&1 || true
         pacman-key --populate archlinux || warn "pacman-key --populate archlinux failed"
@@ -281,7 +282,7 @@ fetch_cursor_theme() { # $1 = destination dir inside the overlay
         die "cannot download $CURSOR_URL"
     fi
     rm -f "$tmp"
-    tar -tf "$dir/Bibata-Modern-Classic.tar.xz" 2>/dev/null | grep -q '^Bibata-Modern-Classic/cursors/' \
+    grep -q '^Bibata-Modern-Classic/cursors/' < <(tar -tf "$dir/Bibata-Modern-Classic.tar.xz" 2>/dev/null) \
         || die "unexpected cursor archive layout"
     install -Dm644 "$dir/Bibata-Modern-Classic.tar.xz" "$1/Bibata-Modern-Classic.tar.xz"
 }

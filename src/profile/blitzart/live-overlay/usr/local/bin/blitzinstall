@@ -145,7 +145,7 @@ cfg_locale() {
     l=$(input "Locale" "Locale (must exist in /etc/locale.gen):" "$LOCALE_V") || return
     grep -qE "^#?${l//./\\.} " /etc/locale.gen || { msgbox "Unknown locale: $l"; return; }
     k=$(input "Keymap" "Console keymap (e.g. us, pl, de-latin1):" "$KEYMAP_V") || return
-    find /usr/share/kbd/keymaps -name "$k.map*" 2>/dev/null | grep -q . || { msgbox "Unknown keymap: $k"; return; }
+    grep -q . < <(find /usr/share/kbd/keymaps -name "$k.map*" 2>/dev/null) || { msgbox "Unknown keymap: $k"; return; }
     LOCALE_V=$l; KEYMAP_V=$k
     loadkeys "$k" 2>/dev/null || true
 }
