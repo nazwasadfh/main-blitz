@@ -60,7 +60,7 @@ With **Yes**, additionally:
 - `sddm` + `sddm-dinit` (service enabled; never started in the live ISO), theme **sddm-slice**
   (cloned at build time, copied from the ISO; `/etc/sddm.conf` -> `[Theme] Current=sddm-slice`);
   theme deps `qt6-5compat`, `qt6-virtualkeyboard`, `ttf-roboto`; `xorg-server` for sddm's X11 greeter.
-- `hyprland` (+ portal, hyprlock, hypridle, qt wayland, wl-clipboard, playerctl, brightnessctl, swaybg),
+- `hyprland`, `hyprpm` (+ `ninja`, for building plugins) (+ portal, hyprlock, hypridle, qt wayland, wl-clipboard, playerctl, brightnessctl, swaybg),
   and the dots' `hypr` directory -> `~/.config/hypr`.
 - `kitty`, `dolphin` (pacman, network) and `brave-bin` (chaotic-aur, network).
 
@@ -68,3 +68,21 @@ All sddm/hyprland packages and the theme are cached in the ISO (offline repo), s
 roughly a gigabyte. Built with `-n` they are downloaded instead.
 Note: the dots' hypr config launches tools not installed here (quickshell `qs`, rofi, hy3 plugin, ...)
 and has some hard-coded `/home/imfl/...` paths.
+
+sddm-slice fix: the theme ships Qt6 imports but no `QtVersion` in `metadata.desktop`, so SDDM started the
+Qt5 greeter ("Library import requires a version") and fell back to the default theme. build-iso patches the
+staged theme (`QtVersion=6`) and blitzinstall re-checks it when copying the theme to the target.
+
+### Dark theme (GUI option only)
+
+GTK 3/4: Adwaita-dark (`gnome-themes-extra`, `settings.ini`, `GTK_THEME=Adwaita:dark`, dconf default `prefer-dark`
++ `xdg-desktop-portal-gtk` settings portal). Qt6: `qt6ct` (Fusion + `darker` palette, `QT_QPA_PLATFORMTHEME=qt6ct`).
+KDE apps (dolphin): `~/.config/kdeglobals` = BreezeDark + `breeze-dark` icons. Env vars live in `/etc/profile.d/blitzart-dark.sh`
+and `/etc/environment`. Qt5-only apps follow the KDE/GTK settings where they can (no qt5ct).
+
+### Cursor (GUI option only)
+
+Bibata-Modern-Classic (regular, size 24) for Wayland, X11 and XWayland. It is AUR-only, so build-iso bundles the upstream
+release tarball into the ISO (cached in /var/cache/blitzart-build/bibata) and blitzinstall unpacks it to
+`/usr/share/icons`. Set via `XCURSOR_THEME`/`XCURSOR_SIZE` (`/etc/profile.d/blitzart-cursor.sh`, `/etc/environment`),
+`/usr/share/icons/default/index.theme` (X11 fallback), GTK `settings.ini` and a dconf default.

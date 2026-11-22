@@ -29,8 +29,11 @@ BA_BASE_PKGS=(
 # sddm-slice is a Qt6 theme: needs qt6-5compat (Qt5Compat.GraphicalEffects) + qt6-virtualkeyboard.
 BA_GUI_PKGS=(
     sddm sddm-dinit qt6-5compat qt6-virtualkeyboard ttf-roboto xorg-server
-    hyprland xdg-desktop-portal-hyprland hyprlock hypridle qt5-wayland qt6-wayland
+    hyprland hyprpm ninja xdg-desktop-portal-hyprland hyprlock hypridle qt5-wayland qt6-wayland qt6-svg
     wl-clipboard playerctl brightnessctl swaybg
+    # dark theme: GTK (Adwaita-dark), Qt6 (qt6ct palette), KDE apps (BreezeDark), dconf default
+    gnome-themes-extra adwaita-icon-theme qt6ct breeze breeze-icons
+    dconf gsettings-desktop-schemas xdg-desktop-portal-gtk
 )
 # downloaded during installation (not cached in the ISO)
 BA_GUI_NET_PKGS=(kitty dolphin)

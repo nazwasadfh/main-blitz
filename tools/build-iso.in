@@ -17,6 +17,7 @@ readonly OMZ_URL="https://github.com/ohmyzsh/ohmyzsh"
 readonly OMZ_DIR="/tmp/blitzart-omz"
 readonly SDDM_URL="https://github.com/EricKotato/sddm-slice"
 readonly SDDM_DIR="/tmp/blitzart-sddm-slice"
+readonly CURSOR_URL="https://github.com/ful1e5/Bibata_Cursor/releases/latest/download/Bibata-Modern-Classic.tar.xz"
 readonly STATE_DIR="/var/cache/blitzart-build"
 readonly MARK="# blitzart-managed"
 
@@ -254,6 +255,37 @@ build_offline_repo() { # $1 = destination dir
     info "offline repo: $(find "$dest" -maxdepth 1 -name '*.pkg.tar.*' ! -name '*.sig' | wc -l) signed packages, $(du -sh "$dest" | cut -f1)"
 }
 
+# sddm-slice has Qt6 imports (Qt5Compat.GraphicalEffects) but its metadata.desktop has no QtVersion,
+# so SDDM starts the Qt5 greeter and fails with "Library import requires a version".
+patch_sddm_theme() {
+    local md=$1/metadata.desktop
+    [[ -f $md ]] || { warn "sddm-slice has no metadata.desktop"; return 0; }
+    if grep -q '^QtVersion=' "$md"; then sed -i 's/^QtVersion=.*/QtVersion=6/' "$md"
+    else sed -i -e '$a\' "$md"; echo 'QtVersion=6' >>"$md"; fi
+    # Qt6 resolves this module without a version
+    sed -i 's/^import QtQuick\.VirtualKeyboard [0-9.]*$/import QtQuick.VirtualKeyboard/' "$1"/Main.qml "$1"/slice/*.qml 2>/dev/null || true
+    info "sddm-slice patched for the Qt6 greeter (QtVersion=6)"
+}
+
+# Bibata-Modern-Classic cursor (AUR-only, so it is bundled from the upstream release like the dots)
+fetch_cursor_theme() { # $1 = destination dir inside the overlay
+    local dir=$STATE_DIR/bibata tmp
+    mkdir -p "$dir" "$1"
+    tmp=$dir/new.tar.xz; rm -f "$tmp"
+    info "fetching the Bibata-Modern-Classic cursor theme"
+    if curl -fsSL -m 180 -z "$dir/Bibata-Modern-Classic.tar.xz" -o "$tmp" "$CURSOR_URL" && [[ -s $tmp ]]; then
+        mv "$tmp" "$dir/Bibata-Modern-Classic.tar.xz"
+    elif [[ -f $dir/Bibata-Modern-Classic.tar.xz ]]; then
+        info "cursor theme: using the cached copy"
+    else
+        die "cannot download $CURSOR_URL"
+    fi
+    rm -f "$tmp"
+    tar -tf "$dir/Bibata-Modern-Classic.tar.xz" 2>/dev/null | grep -q '^Bibata-Modern-Classic/cursors/' \
+        || die "unexpected cursor archive layout"
+    install -Dm644 "$dir/Bibata-Modern-Classic.tar.xz" "$1/Bibata-Modern-Classic.tar.xz"
+}
+
 # ------------------------------------------------------------------ profile staging
 stage_profile() {
     local iso_profiles=$WORKSPACE/iso-profiles
@@ -288,6 +320,9 @@ stage_profile() {
     # sddm-slice theme -> /usr/share/blitzart/sddm-theme/sddm-slice (no .git); used only by the GUI option
     mkdir -p "$lo/usr/share/blitzart/sddm-theme/sddm-slice"
     (cd "$SDDM_DIR" && tar --exclude=.git -cf - .) | tar -xf - -C "$lo/usr/share/blitzart/sddm-theme/sddm-slice"
+    patch_sddm_theme "$lo/usr/share/blitzart/sddm-theme/sddm-slice"
+
+    fetch_cursor_theme "$lo/usr/share/blitzart/cursors"
 
     # live user's skel: same dots (no hypr: the live session stays a plain tty), so the tty session looks like the installed system
     local skel=$lo/etc/skel

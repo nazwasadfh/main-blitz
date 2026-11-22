@@ -477,6 +477,94 @@ EOF
     fi
 }
 
+gui_dark_theme() { # EXPERIMENTAL GUI only: dark theme for GTK, Qt6 and KDE apps
+    local u=$1 home
+    # system-wide: Qt platform theme + dark GTK (login sessions source /etc/profile.d; /etc/environment via PAM)
+    mkdir -p "$MNT/etc/profile.d"
+    cat >"$MNT/etc/profile.d/blitzart-dark.sh" <<'EOF'
+export QT_QPA_PLATFORMTHEME=qt6ct
+export GTK_THEME=Adwaita:dark
+EOF
+    printf 'QT_QPA_PLATFORMTHEME=qt6ct\nGTK_THEME=Adwaita:dark\n' >>"$MNT/etc/environment"
+
+    # dconf system default (GTK4 / libadwaita / xdg-desktop-portal-gtk settings portal)
+    mkdir -p "$MNT/etc/dconf/profile" "$MNT/etc/dconf/db/local.d"
+    printf 'user-db:user\nsystem-db:local\n' >"$MNT/etc/dconf/profile/user"
+    cat >"$MNT/etc/dconf/db/local.d/00-blitzart-dark" <<'EOF'
+[org/gnome/desktop/interface]
+color-scheme='prefer-dark'
+gtk-theme='Adwaita-dark'
+icon-theme='Adwaita'
+EOF
+    ach dconf update 2>/dev/null || warn "dconf update failed (GTK4 dark default may be missing)"
+
+    for home in "$MNT/etc/skel" "$MNT/home/$u"; do
+        mkdir -p "$home/.config/gtk-3.0" "$home/.config/gtk-4.0" "$home/.config/qt6ct"
+        cat >"$home/.config/gtk-3.0/settings.ini" <<'EOF'
+[Settings]
+gtk-application-prefer-dark-theme=1
+gtk-theme-name=Adwaita-dark
+gtk-icon-theme-name=Adwaita
+EOF
+        cat >"$home/.config/gtk-4.0/settings.ini" <<'EOF'
+[Settings]
+gtk-application-prefer-dark-theme=1
+gtk-icon-theme-name=Adwaita
+EOF
+        cat >"$home/.config/qt6ct/qt6ct.conf" <<'EOF'
+[Appearance]
+color_scheme_path=/usr/share/qt6ct/colors/darker.conf
+custom_palette=true
+icon_theme=breeze-dark
+standard_dialogs=default
+style=Fusion
+EOF
+        # KDE apps (dolphin) read their colours from kdeglobals
+        if [[ -f $MNT/usr/share/color-schemes/BreezeDark.colors ]]; then
+            cp "$MNT/usr/share/color-schemes/BreezeDark.colors" "$home/.config/kdeglobals"
+            printf '\n[Icons]\nTheme=breeze-dark\n' >>"$home/.config/kdeglobals"
+        else
+            warn "BreezeDark.colors not found - dolphin will not get the dark scheme"
+        fi
+    done
+    info "dark theme configured (GTK, Qt6, KDE)"
+}
+
+gui_cursor_theme() { # EXPERIMENTAL GUI only: Bibata-Modern-Classic for Wayland, X11 and XWayland
+    local u=$1 home theme=Bibata-Modern-Classic size=24 f=$SHARE/cursors/Bibata-Modern-Classic.tar.xz
+    if [[ ! -f $f ]]; then warn "cursor theme is missing from this ISO - skipped"; return 0; fi
+    mkdir -p "$MNT/usr/share/icons"
+    rm -rf "$MNT/usr/share/icons/$theme"
+    tar -xf "$f" -C "$MNT/usr/share/icons" || { warn "could not unpack the cursor theme"; return 0; }
+    chmod -R a+rX "$MNT/usr/share/icons/$theme"
+
+    # X11 / XWayland default (apps that ignore the environment)
+    mkdir -p "$MNT/usr/share/icons/default"
+    printf '[Icon Theme]\nInherits=%s\n' "$theme" >"$MNT/usr/share/icons/default/index.theme"
+
+    # Wayland compositors + X toolkits + XWayland all read XCURSOR_*
+    cat >"$MNT/etc/profile.d/blitzart-cursor.sh" <<EOF
+export XCURSOR_THEME=$theme
+export XCURSOR_SIZE=$size
+EOF
+    printf 'XCURSOR_THEME=%s\nXCURSOR_SIZE=%s\n' "$theme" "$size" >>"$MNT/etc/environment"
+
+    # GTK (settings.ini) + dconf default
+    for home in "$MNT/etc/skel" "$MNT/home/$u"; do
+        for f in "$home/.config/gtk-3.0/settings.ini" "$home/.config/gtk-4.0/settings.ini"; do
+            [[ -f $f ]] && printf 'gtk-cursor-theme-name=%s\ngtk-cursor-theme-size=%s\n' "$theme" "$size" >>"$f"
+        done
+    done
+    mkdir -p "$MNT/etc/dconf/db/local.d"
+    cat >"$MNT/etc/dconf/db/local.d/01-blitzart-cursor" <<EOF
+[org/gnome/desktop/interface]
+cursor-theme='$theme'
+cursor-size=$size
+EOF
+    ach dconf update 2>/dev/null || warn "dconf update failed"
+    info "cursor theme: $theme ($size)"
+}
+
 phase_gui() { # EXPERIMENTAL: only runs when GUI=1; with GUI=0 the install is unchanged
     ((GUI)) || return 0
     msg "Installing graphical stack (EXPERIMENTAL)"
@@ -496,12 +584,20 @@ phase_gui() { # EXPERIMENTAL: only runs when GUI=1; with GUI=0 the install is un
         mkdir -p "$MNT/usr/share/sddm/themes"
         rm -rf "$MNT/usr/share/sddm/themes/sddm-slice"
         cp -r "$SHARE/sddm-theme/sddm-slice" "$MNT/usr/share/sddm/themes/sddm-slice"
+        local md="$MNT/usr/share/sddm/themes/sddm-slice/metadata.desktop"
+        if [[ -f $md ]]; then   # force the Qt6 greeter (avoids "Library import requires a version")
+            if grep -q '^QtVersion=' "$md"; then sed -i 's/^QtVersion=.*/QtVersion=6/' "$md"
+            else sed -i -e '$a\' "$md"; echo 'QtVersion=6' >>"$md"; fi
+        fi
         printf '[Theme]\nCurrent=sddm-slice\n' >"$MNT/etc/sddm.conf"
         info "sddm theme: sddm-slice"
     else
         warn "sddm-slice theme is missing from this ISO - sddm will use its default theme"
     fi
     enable_svc sddm
+
+    gui_dark_theme "$u"
+    gui_cursor_theme "$u"
 
     # Hyprland config from the dots
     blitzart_apply_hypr "$MNT/home/$u"
