@@ -23,6 +23,7 @@ KERNELS=(linux)
 ROOT_PW=""; USER_NAME=""; USER_PW=""
 TZ_V="UTC"; LOCALE_V="en_US.UTF-8"; KEYMAP_V="us"
 EXTRA_PKGS=""
+GUI=0   # "Install graphical stuff (EXPERIMENTAL)", default No
 
 # ---------------------------------------------------------------- helpers
 C=$'\e[36m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; B=$'\e[1m'; N=$'\e[0m'
@@ -161,14 +162,28 @@ cfg_user() {
 # ---------------------------------------------------------------- main menu
 status() { [[ -n $1 ]] && echo "$1" || echo "(not set)"; }
 
+cfg_gui() {
+    if DLG --title "Graphical stuff (EXPERIMENTAL)" --defaultno --yesno \
+"Install the graphical stack?\n
+  - SDDM (theme: sddm-slice), enabled at boot
+  - Hyprland + ~/.config/hypr from the dots
+  - kitty, dolphin, brave (downloaded)\n
+This is experimental. Choose No for the plain console system." 15 66; then
+        GUI=1
+    else
+        GUI=0
+    fi
+}
+
 main_menu() {
-    local choice disk_s
+    local choice disk_s gui_s
     while :; do
         if [[ -z $DISK ]]; then disk_s="(not set)"
         elif [[ $PART_MODE == auto ]]; then disk_s="auto: $DISK"
         else disk_s="manual: $ESP_PART + $ROOT_PART"; fi
+        ((GUI)) && gui_s=Yes || gui_s=No
         choice=$(DLG --stdout --title "BlitzArt Linux" --cancel-label "Abort" --menu \
-            "Configure the installation, then choose Install." 22 72 10 \
+            "Configure the installation, then choose Install." 24 76 12 \
             1 "Hostname              [$HOSTNAME_V]" \
             2 "Disk configuration    [$disk_s]" \
             3 "Kernels               [${KERNELS[*]}]" \
@@ -177,7 +192,8 @@ main_menu() {
             6 "Timezone              [$TZ_V]" \
             7 "Locale / keymap       [$LOCALE_V / $KEYMAP_V]" \
             8 "Additional packages   [${EXTRA_PKGS:-none}]" \
-            9 ">> Install" \
+            9 "Install graphical stuff (EXPERIMENTAL)  [$gui_s]" \
+            i ">> Install" \
             0 "Abort") || { clear; exit 0; }
         case $choice in
             1) local h; h=$(input "Hostname" "Hostname:" "$HOSTNAME_V") && [[ $h =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] && HOSTNAME_V=$h ;;
@@ -188,7 +204,8 @@ main_menu() {
             6) cfg_timezone ;;
             7) cfg_locale ;;
             8) EXTRA_PKGS=$(input "Additional packages" "Extra packages (space separated, from any enabled repo):" "$EXTRA_PKGS") || true ;;
-            9) validate && return 0 ;;
+            9) cfg_gui ;;
+            i) validate && return 0 ;;
             0) clear; exit 0 ;;
         esac
     done
@@ -201,6 +218,7 @@ validate() {
     [[ -n $USER_NAME ]] || miss+=("user account")
     if ((${#miss[@]})); then msgbox "Still missing: ${miss[*]}"; return 1; fi
     local summary="Disk:     $DISK ($PART_MODE)\nHostname: $HOSTNAME_V\nKernels:  ${KERNELS[*]}\nUser:     $USER_NAME\nTimezone: $TZ_V\nLocale:   $LOCALE_V / $KEYMAP_V"
+    ((GUI)) && summary+="\nGraphical: Yes (EXPERIMENTAL: SDDM + Hyprland + kitty, dolphin, brave)"
     if [[ $PART_MODE == auto ]]; then
         summary+="\n\n!! ALL DATA ON $DISK WILL BE DESTROYED (blkdiscard + new GPT) !!"
     else
@@ -459,6 +477,45 @@ EOF
     fi
 }
 
+phase_gui() { # EXPERIMENTAL: only runs when GUI=1; with GUI=0 the install is unchanged
+    ((GUI)) || return 0
+    msg "Installing graphical stack (EXPERIMENTAL)"
+    local u=$USER_NAME
+
+    # sddm + hyprland + deps: from the offline repo on the ISO (basestrap -C = local repo first)
+    if ! basestrap -C /tmp/blitzart-pacman.conf "$MNT" "${BA_GUI_PKGS[@]}"; then
+        warn "graphical packages failed to install - skipping the graphical setup"
+        return 0
+    fi
+
+    # sddm system user (in case the sysusers hook did not run in the chroot)
+    ach id sddm >/dev/null 2>&1 || ach useradd -r -M -d /var/lib/sddm -s /usr/bin/nologin -G video sddm 2>/dev/null || true
+
+    # sddm-slice theme (bundled into the ISO at build time, no download)
+    if [[ -d $SHARE/sddm-theme/sddm-slice ]]; then
+        mkdir -p "$MNT/usr/share/sddm/themes"
+        rm -rf "$MNT/usr/share/sddm/themes/sddm-slice"
+        cp -r "$SHARE/sddm-theme/sddm-slice" "$MNT/usr/share/sddm/themes/sddm-slice"
+        printf '[Theme]\nCurrent=sddm-slice\n' >"$MNT/etc/sddm.conf"
+        info "sddm theme: sddm-slice"
+    else
+        warn "sddm-slice theme is missing from this ISO - sddm will use its default theme"
+    fi
+    enable_svc sddm
+
+    # Hyprland config from the dots
+    blitzart_apply_hypr "$MNT/home/$u"
+    ach chown -R "$u:$u" "/home/$u"
+
+    # kitty, dolphin: network; brave: chaotic-aur
+    ach pacman -S --noconfirm --needed "${BA_GUI_NET_PKGS[@]}" || warn "could not install: ${BA_GUI_NET_PKGS[*]}"
+    if grep -q '^\[chaotic-aur\]' "$MNT/etc/pacman.conf"; then
+        ach pacman -S --noconfirm --needed "${BA_GUI_CHAOTIC_PKGS[@]}" || warn "could not install brave (chaotic-aur)"
+    else
+        warn "chaotic-aur is not configured - brave was not installed (run: sudo pacman -S brave-bin later)"
+    fi
+}
+
 phase_boot() {
     msg "Enabling pacman snapshots (pre/post)"
     install -Dm755 "$SHARE/blitzart-snap" "$MNT/usr/local/bin/blitzart-snap"
@@ -496,6 +553,7 @@ do_install() {
     phase_base
     phase_configure
     phase_repos
+    phase_gui
     phase_boot
     sync
     msg "Installation finished"

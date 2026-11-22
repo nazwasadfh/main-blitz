@@ -26,3 +26,13 @@ blitzart_apply_dots() {
     [[ -n $owner ]] && chown -R "$owner" "$h/.config" "$h/.zshrc" "$h/.oh-my-zsh" 2>/dev/null
     return 0
 }
+
+# blitzart_apply_hypr <home> [owner]  - only used when the graphical option is selected
+blitzart_apply_hypr() {
+    local h=$1 owner=${2:-}
+    [[ -d $BA_DOTS/hypr ]] || return 0
+    mkdir -p "$h/.config"
+    rm -rf "$h/.config/hypr"; cp -r "$BA_DOTS/hypr" "$h/.config/hypr"
+    [[ -n $owner ]] && chown -R "$owner" "$h/.config/hypr" 2>/dev/null
+    return 0
+}

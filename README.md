@@ -50,3 +50,21 @@ GRUB on the installed system: `GRUB_TIMEOUT=-1` (menu waits for a choice), `GRUB
 `pipewire`, `pipewire-pulse`, `wireplumber` + their `-dinit` packages are installed. The three user services
 (`pipewire`, `pipewire-pulse`, `wireplumber`) are enabled via `~/.config/dinit.d/boot.d/` for the created user
 and for `/etc/skel` (new users); in the live session through the live skel. Requires `dinit-user-spawn`.
+
+## Graphical stack (EXPERIMENTAL, off by default)
+
+blitzinstall menu: "Install graphical stuff (EXPERIMENTAL)" - default **No**. With No nothing changes
+(the live ISO and the default install stay console-only).
+
+With **Yes**, additionally:
+- `sddm` + `sddm-dinit` (service enabled; never started in the live ISO), theme **sddm-slice**
+  (cloned at build time, copied from the ISO; `/etc/sddm.conf` -> `[Theme] Current=sddm-slice`);
+  theme deps `qt6-5compat`, `qt6-virtualkeyboard`, `ttf-roboto`; `xorg-server` for sddm's X11 greeter.
+- `hyprland` (+ portal, hyprlock, hypridle, qt wayland, wl-clipboard, playerctl, brightnessctl, swaybg),
+  and the dots' `hypr` directory -> `~/.config/hypr`.
+- `kitty`, `dolphin` (pacman, network) and `brave-bin` (chaotic-aur, network).
+
+All sddm/hyprland packages and the theme are cached in the ISO (offline repo), so the ISO grows by
+roughly a gigabyte. Built with `-n` they are downloaded instead.
+Note: the dots' hypr config launches tools not installed here (quickshell `qs`, rofi, hy3 plugin, ...)
+and has some hard-coded `/home/imfl/...` paths.

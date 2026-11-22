@@ -24,11 +24,23 @@ BA_BASE_PKGS=(
 )
 
 # kernel packages cached in the offline repo (others come from the network)
+# Optional graphical stack (blitzinstall: "Install graphical stuff (EXPERIMENTAL)").
+# Cached in the ISO's offline repo (nothing here is installed in the live system).
+# sddm-slice is a Qt6 theme: needs qt6-5compat (Qt5Compat.GraphicalEffects) + qt6-virtualkeyboard.
+BA_GUI_PKGS=(
+    sddm sddm-dinit qt6-5compat qt6-virtualkeyboard ttf-roboto xorg-server
+    hyprland xdg-desktop-portal-hyprland hyprlock hypridle qt5-wayland qt6-wayland
+    wl-clipboard playerctl brightnessctl swaybg
+)
+# downloaded during installation (not cached in the ISO)
+BA_GUI_NET_PKGS=(kitty dolphin)
+BA_GUI_CHAOTIC_PKGS=(brave-bin)   # chaotic-aur
+
 # per-user dinit services enabled for every new user (see blitzinstall / live skel)
 BA_USER_SERVICES=(pipewire pipewire-pulse wireplumber)
 
 BA_OFFLINE_KERNELS=(linux)
 
 ba_all_offline_pkgs() {
-    printf '%s\n' "${BA_BASE_PKGS[@]}" "${BA_TOOLS_PKGS[@]}" "${BA_OFFLINE_KERNELS[@]}"
+    printf '%s\n' "${BA_BASE_PKGS[@]}" "${BA_TOOLS_PKGS[@]}" "${BA_OFFLINE_KERNELS[@]}" "${BA_GUI_PKGS[@]}"
 }

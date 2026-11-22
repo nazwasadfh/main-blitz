@@ -15,6 +15,8 @@ readonly DOTS_URL="${BLITZART_DOTS_URL:-https://github.com/nazwasadfh/dots}"
 readonly DOTS_DIR="${BLITZART_DOTS_DIR:-/tmp/blitzart-dots}"
 readonly OMZ_URL="https://github.com/ohmyzsh/ohmyzsh"
 readonly OMZ_DIR="/tmp/blitzart-omz"
+readonly SDDM_URL="https://github.com/EricKotato/sddm-slice"
+readonly SDDM_DIR="/tmp/blitzart-sddm-slice"
 readonly STATE_DIR="/var/cache/blitzart-build"
 readonly MARK="# blitzart-managed"
 
@@ -201,7 +203,10 @@ check_package_names() {
     local names out rc=0 missing
     msg "Verifying that every package in the profile exists in the configured repos"
     sync_dl_db
-    mapfile -t names < <(profile_package_names)
+    # shellcheck disable=SC1091
+    mapfile -t names < <({ profile_package_names
+        ( . "$STAGE/profile/$PROFILE/live-overlay/usr/lib/blitzart/packages.sh"; ba_all_offline_pkgs; printf '%s\n' "${BA_GUI_NET_PKGS[@]}" )
+    } | sort -u)
     ((${#names[@]})) || die "could not read any package names from the profile"
     out=$(pacman --config "$STATE_DIR/pacman-dl.conf" --dbpath "$STATE_DIR/db" --logfile /dev/null --noconfirm \
           -Sp "${names[@]}" 2>&1 >/dev/null) || rc=$?
@@ -269,18 +274,22 @@ stage_profile() {
     # installer + toolbox
     install -Dm755 "$STAGE/data/blitz" "$lo/usr/local/bin/blitz"
 
-    # dots (fastfetch, eza, kitty, starship.toml, .zshrc) -> /usr/share/blitzart/dots
+    # dots (fastfetch, eza, hypr, kitty, starship.toml, .zshrc); hypr is installed only with the GUI option -> /usr/share/blitzart/dots
     local d=$lo/usr/share/blitzart/dots
     mkdir -p "$d"
     local item
-    for item in fastfetch eza kitty starship.toml .zshrc; do
+    for item in fastfetch eza hypr kitty starship.toml .zshrc; do
         if [[ -e $DOTS_DIR/$item ]]; then cp -a "$DOTS_DIR/$item" "$d/"; else warn "dots repo has no '$item'"; fi
     done
     # oh-my-zsh -> /usr/share/blitzart/oh-my-zsh (no .git)
     mkdir -p "$lo/usr/share/blitzart/oh-my-zsh"
     (cd "$OMZ_DIR" && tar --exclude=.git -cf - .) | tar -xf - -C "$lo/usr/share/blitzart/oh-my-zsh"
 
-    # live user's skel: same dots, so the tty session looks like the installed system
+    # sddm-slice theme -> /usr/share/blitzart/sddm-theme/sddm-slice (no .git); used only by the GUI option
+    mkdir -p "$lo/usr/share/blitzart/sddm-theme/sddm-slice"
+    (cd "$SDDM_DIR" && tar --exclude=.git -cf - .) | tar -xf - -C "$lo/usr/share/blitzart/sddm-theme/sddm-slice"
+
+    # live user's skel: same dots (no hypr: the live session stays a plain tty), so the tty session looks like the installed system
     local skel=$lo/etc/skel
     mkdir -p "$skel/.config"
     [[ -d $d/fastfetch ]]     && cp -a "$d/fastfetch" "$skel/.config/"
@@ -306,6 +315,7 @@ main() {
     extract_payload
     sync_repo "$DOTS_URL" "$DOTS_DIR" "dots"
     sync_repo "$OMZ_URL" "$OMZ_DIR" "oh-my-zsh"
+    sync_repo "$SDDM_URL" "$SDDM_DIR" "sddm-slice theme"
     install_artools_conf
     check_package_names
     stage_profile
