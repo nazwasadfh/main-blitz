@@ -22,6 +22,7 @@ Dots copied from the repo: `fastfetch`, `eza`, `kitty` -> `~/.config/`, `starshi
 - Subvolumes: `@` (/, includes /home, /var/log, kernels) · `@snapshots` (/.snapshots) · `@pkg` (/var/cache/pacman/pkg).
   A snapshot of `/` therefore rolls back the whole system, home included. `/` in fstab has no `subvol=`
   so grub-btrfs snapshot entries boot correctly.
+- chrony + chrony-dinit installed, service `chronyd` enabled (time sync).
 - snapper config `root` (what `blitz` expects), baseline snapshot after install, `grub-btrfsd` as dinit service.
 - Plain `pacman`/`paru` transactions (install/upgrade/remove) get a snapper pre/post pair via pacman hooks
   (`blitzart-snap`). Skipped when pacman is driven by `blitz` (blitz update makes its own pair) or when

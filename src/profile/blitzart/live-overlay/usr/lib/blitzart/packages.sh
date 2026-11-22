@@ -19,6 +19,7 @@ BA_BASE_PKGS=(
     networkmanager networkmanager-dinit acpid-dinit cronie-dinit
     sudo nano neovim curl wget rsync man-db man-pages
     pacman-contrib reflector
+    chrony chrony-dinit
     pipewire pipewire-pulse wireplumber
     pipewire-dinit pipewire-pulse-dinit wireplumber-dinit
 )

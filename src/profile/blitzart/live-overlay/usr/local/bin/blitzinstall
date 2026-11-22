@@ -440,7 +440,7 @@ EOF
 
     # --- services
     local s
-    for s in dbus elogind NetworkManager acpid cronie dinit-user-spawn grub-btrfsd; do enable_svc "$s"; done
+    for s in dbus elogind NetworkManager acpid cronie chronyd dinit-user-spawn grub-btrfsd; do enable_svc "$s"; done
 }
 
 phase_repos() { # chaotic-aur + blackarch (network), then paru
