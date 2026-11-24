@@ -17,6 +17,16 @@ readonly OMZ_URL="https://github.com/ohmyzsh/ohmyzsh"
 readonly OMZ_DIR="/tmp/blitzart-omz"
 readonly SDDM_URL="https://github.com/EricKotato/sddm-slice"
 readonly SDDM_DIR="/tmp/blitzart-sddm-slice"
+readonly II_URL="https://github.com/end-4/dots-hyprland"
+readonly II_DIR="/tmp/blitzart-dots-hyprland"
+readonly E4_URL="https://github.com/pctrade/end4-pC"
+readonly E4_DIR="/tmp/blitzart-end4-pc"
+readonly CHAOTIC_KEY="3056513887B78AEB"
+readonly CHAOTIC_GPG="/var/cache/blitzart-build/gnupg-chaotic"
+# not in the dependency lists of ii itself, but needed by its dinit setup / the dots
+readonly II_EXTRA_PKGS=(yay uv rsync git base-devel bluez bluez-utils bluez-dinit power-profiles-daemon
+    power-profiles-daemon-dinit networkmanager-dinit pipewire-dinit pipewire-pulse-dinit wireplumber-dinit
+    easyeffects cliphist ydotool)
 readonly CURSOR_URL="https://github.com/ful1e5/Bibata_Cursor/releases/latest/download/Bibata-Modern-Classic.tar.xz"
 readonly STATE_DIR="/var/cache/blitzart-build"
 readonly MARK="# blitzart-managed"
@@ -226,8 +236,54 @@ check_package_names() {
 }
 
 # ------------------------------------------------------------------ offline repo
+# Download <pkg>... (+ dependencies) with <conf>/<db>, verify signatures, copy packages + .sig to <dest>.
+cache_packages() { # conf db dest pkg...
+    local conf=$1 db=$2 dest=$3 urls f
+    shift 3
+    mapfile -t urls < <(pacman --config "$conf" --dbpath "$db" --logfile /dev/null --noconfirm -Sp "$@" 2>/dev/null | grep -E '^(https?|file)://')
+    ((${#urls[@]})) || return 1
+    pacman --config "$conf" --dbpath "$db" --cachedir "$STATE_DIR/pkgs" --logfile /dev/null \
+        --noconfirm -Sw "$@" || return 1
+    mkdir -p "$dest"
+    for f in "${urls[@]}"; do
+        f=$(basename "$f")
+        [[ -f $STATE_DIR/pkgs/$f ]]     || { warn "expected $f in the cache"; return 1; }
+        [[ -f $STATE_DIR/pkgs/$f.sig ]] || { warn "missing signature for $f (refusing to build an unsigned repo)"; return 1; }
+        cp -al --reflink=auto "$STATE_DIR/pkgs/$f" "$dest/$f" 2>/dev/null || cp "$STATE_DIR/pkgs/$f" "$dest/$f"
+        cp -al --reflink=auto "$STATE_DIR/pkgs/$f.sig" "$dest/$f.sig" 2>/dev/null || cp "$STATE_DIR/pkgs/$f.sig" "$dest/$f.sig"
+    done
+}
+
+# chaotic-aur for the BUILD only: an isolated keyring (artix + arch + chaotic), the host keyring is not touched
+setup_chaotic_dl() {
+    [[ -f $STATE_DIR/chaotic.ok ]] && return 0
+    rm -rf "$CHAOTIC_GPG"; mkdir -p "$CHAOTIC_GPG"; chmod 700 "$CHAOTIC_GPG"
+    pacman-key --gpgdir "$CHAOTIC_GPG" --init >/dev/null 2>&1 || return 1
+    pacman-key --gpgdir "$CHAOTIC_GPG" --populate artix archlinux >/dev/null 2>&1 || return 1
+    pacman-key --gpgdir "$CHAOTIC_GPG" --keyserver keyserver.ubuntu.com --recv-keys "$CHAOTIC_KEY" >/dev/null 2>&1 || return 1
+    pacman-key --gpgdir "$CHAOTIC_GPG" --lsign-key "$CHAOTIC_KEY" >/dev/null 2>&1 || return 1
+    : >"$STATE_DIR/chaotic.ok"
+}
+
+write_chaotic_conf() { # file
+    write_pacman_conf "$1" "Required DatabaseOptional"
+    sed -i "0,/^\[options\]/s||[options]\nGPGDir = $CHAOTIC_GPG|" "$1"
+    cat >>"$1" <<EOF
+
+[chaotic-aur]
+Server = https://cdn-mirror.chaotic.cx/\$repo/\$arch
+EOF
+}
+
+sync_chaotic_db() {
+    mkdir -p "$STATE_DIR/db-chaotic/local"
+    write_chaotic_conf "$STATE_DIR/pacman-chaotic.conf"
+    pacman --config "$STATE_DIR/pacman-chaotic.conf" --dbpath "$STATE_DIR/db-chaotic" --logfile /dev/null \
+        --noconfirm -Sy >/dev/null 2>&1
+}
+
 build_offline_repo() { # $1 = destination dir
-    local dest=$1 conf db pkgs urls f
+    local dest=$1 pkgs
     # shellcheck disable=SC1091
     . "$STAGE/profile/$PROFILE/live-overlay/usr/lib/blitzart/packages.sh"
     mapfile -t pkgs < <(ba_all_offline_pkgs | sort -u)
@@ -236,24 +292,69 @@ build_offline_repo() { # $1 = destination dir
     # signatures are downloaded and verified against the host keyring (artix + archlinux);
     # the .sig files are shipped next to the packages so the installer verifies them again
     sync_dl_db
-    conf=$STATE_DIR/pacman-dl.conf
-    db=$STATE_DIR/db
-    mapfile -t urls < <(pacman --config "$conf" --dbpath "$db" --logfile /dev/null --noconfirm -Sp "${pkgs[@]}" 2>/dev/null | grep -E '^(https?|file)://')
-    ((${#urls[@]})) || die "could not resolve the package set (a package name changed?)"
-    pacman --config "$conf" --dbpath "$db" --cachedir "$STATE_DIR/pkgs" --logfile /dev/null \
-        --noconfirm -Sw "${pkgs[@]}" || die "package download failed"
+    cache_packages "$STATE_DIR/pacman-dl.conf" "$STATE_DIR/db" "$dest" "${pkgs[@]}" || die "package download failed"
 
-    mkdir -p "$dest"
-    for f in "${urls[@]}"; do
-        f=$(basename "$f")
-        [[ -f $STATE_DIR/pkgs/$f ]]     || die "expected $f in the cache"
-        [[ -f $STATE_DIR/pkgs/$f.sig ]] || die "missing signature for $f (refusing to build an unsigned repo)"
-        cp -al --reflink=auto "$STATE_DIR/pkgs/$f" "$dest/$f" 2>/dev/null || cp "$STATE_DIR/pkgs/$f" "$dest/$f"
-        cp -al --reflink=auto "$STATE_DIR/pkgs/$f.sig" "$dest/$f.sig" 2>/dev/null || cp "$STATE_DIR/pkgs/$f.sig" "$dest/$f.sig"
-    done
+    # prebuilt AUR dependencies of illogical-impulse from chaotic-aur (best effort)
+    if ((${#BA_II_CHAOTIC_PKGS[@]})); then
+        msg "Caching ${#BA_II_CHAOTIC_PKGS[@]} prebuilt AUR packages from chaotic-aur"
+        if setup_chaotic_dl && sync_chaotic_db; then
+            cache_packages "$STATE_DIR/pacman-chaotic.conf" "$STATE_DIR/db-chaotic" "$dest" "${BA_II_CHAOTIC_PKGS[@]}" \
+                || warn "chaotic-aur caching failed - those packages are fetched at install time instead"
+        else
+            warn "could not set up chaotic-aur for the build - those packages are fetched at install time instead"
+        fi
+    fi
+
     find "$dest" -maxdepth 1 -name '*.pkg.tar.*' ! -name '*.sig' -print0 \
         | xargs -0 repo-add -q "$dest/blitzart-local.db.tar.zst" >/dev/null
     info "offline repo: $(find "$dest" -maxdepth 1 -name '*.pkg.tar.*' ! -name '*.sig' | wc -l) signed packages, $(du -sh "$dest" | cut -f1)"
+}
+
+# illogical-impulse (end-4/dots-hyprland): the Arch dependency lists are the `depends`/`makedepends` of the
+# meta-PKGBUILDs in sdata/dist-arch. Split them into: Artix/Arch repos (cached in the ISO), chaotic-aur
+# prebuilt AUR packages (cached in the ISO) and the rest (AUR/sources: fetched at install time by ii itself).
+read_ii_depends() {
+    local d
+    for d in "$II_DIR"/sdata/dist-arch/illogical-impulse-*/; do
+        bash -c 'cd "$1" && source ./PKGBUILD >/dev/null 2>&1; printf "%s\n" "${depends[@]}" "${makedepends[@]}"' _ "$d"
+    done | grep -v '^$' || true
+}
+
+prepare_ii_packages() {
+    local out=$STAGE/profile/$PROFILE/live-overlay/usr/lib/blitzart/ii-packages.sh
+    local all=() off=() missing=() chao=() net=() res miss p
+    msg "Reading the illogical-impulse dependency lists"
+    mapfile -t all < <({ read_ii_depends; printf '%s\n' "${II_EXTRA_PKGS[@]}"; } | sed -E 's/[<>=].*//' | sort -u)
+    ((${#all[@]} > 10)) || die "could not read the illogical-impulse dependency lists (repo layout changed?)"
+
+    sync_dl_db
+    res=$(pacman --config "$STATE_DIR/pacman-dl.conf" --dbpath "$STATE_DIR/db" --logfile /dev/null --noconfirm \
+          -Sp "${all[@]}" 2>&1 >/dev/null) || true
+    miss=$(grep -i 'target not found' <<<"$res" | sed 's/.*: //') || true
+    for p in "${all[@]}"; do
+        if grep -qxF "$p" <<<"$miss"; then missing+=("$p"); else off+=("$p"); fi
+    done
+
+    if ((OFFLINE && ${#missing[@]})) && setup_chaotic_dl && sync_chaotic_db; then
+        res=$(pacman --config "$STATE_DIR/pacman-chaotic.conf" --dbpath "$STATE_DIR/db-chaotic" --logfile /dev/null \
+              --noconfirm -Sp "${missing[@]}" 2>&1 >/dev/null) || true
+        miss=$(grep -i 'target not found' <<<"$res" | sed 's/.*: //') || true
+        for p in "${missing[@]}"; do
+            if grep -qxF "$p" <<<"$miss"; then net+=("$p"); else chao+=("$p"); fi
+        done
+    else
+        net=("${missing[@]}")
+    fi
+
+    {
+        echo "# generated by build-iso from end-4/dots-hyprland $(git -C "$II_DIR" rev-parse --short HEAD)"
+        echo "BA_II_PKGS=("; for p in "${off[@]}"; do echo "    $p"; done; echo ")"
+        echo "BA_II_CHAOTIC_PKGS=("; for p in "${chao[@]}"; do echo "    $p"; done; echo ")"
+        echo "BA_II_NET_PKGS=("; for p in "${net[@]}"; do echo "    $p"; done; echo ")"
+    } >"$out"
+    info "illogical-impulse: ${#off[@]} packages from the repos, ${#chao[@]} prebuilt from chaotic-aur, ${#net[@]} from AUR/sources at install time"
+    ((${#net[@]})) && info "install-time (AUR/source): ${net[*]}"
+    return 0
 }
 
 # sddm-slice has Qt6 imports (Qt5Compat.GraphicalEffects) but its metadata.desktop has no QtVersion,
@@ -307,7 +408,7 @@ stage_profile() {
     # installer + toolbox
     install -Dm755 "$STAGE/data/blitz" "$lo/usr/local/bin/blitz"
 
-    # dots (fastfetch, eza, hypr, kitty, starship.toml, .zshrc); hypr is installed only with the GUI option -> /usr/share/blitzart/dots
+    # dots (fastfetch, eza, hypr, kitty, starship.toml, .zshrc); hypr is only installed with the GUI option -> /usr/share/blitzart/dots
     local d=$lo/usr/share/blitzart/dots
     mkdir -p "$d"
     local item
@@ -325,7 +426,13 @@ stage_profile() {
 
     fetch_cursor_theme "$lo/usr/share/blitzart/cursors"
 
-    # live user's skel: same dots (no hypr: the live session stays a plain tty), so the tty session looks like the installed system
+    # illogical-impulse + end4-pC, each packed as one archive (with .git so they can be updated later)
+    info "packing dots-hyprland and end4-pC into the ISO"
+    mkdir -p "$lo/usr/share/blitzart"
+    tar -C "$II_DIR" -cJf "$lo/usr/share/blitzart/dots-hyprland.tar.xz" . || die "cannot pack dots-hyprland"
+    tar -C "$E4_DIR" -cJf "$lo/usr/share/blitzart/end4-pC.tar.xz" . || die "cannot pack end4-pC"
+
+    # live user's skel: same dots, so the tty session looks like the installed system
     local skel=$lo/etc/skel
     mkdir -p "$skel/.config"
     [[ -d $d/fastfetch ]]     && cp -a "$d/fastfetch" "$skel/.config/"
@@ -352,7 +459,11 @@ main() {
     sync_repo "$DOTS_URL" "$DOTS_DIR" "dots"
     sync_repo "$OMZ_URL" "$OMZ_DIR" "oh-my-zsh"
     sync_repo "$SDDM_URL" "$SDDM_DIR" "sddm-slice theme"
+    sync_repo "$II_URL" "$II_DIR" "illogical-impulse (dots-hyprland)"
+    git -C "$II_DIR" submodule update --init --recursive --depth 1 -q || warn "dots-hyprland submodules could not be fetched"
+    sync_repo "$E4_URL" "$E4_DIR" "end4-pC"
     install_artools_conf
+    prepare_ii_packages
     check_package_names
     stage_profile
 

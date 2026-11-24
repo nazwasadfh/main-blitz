@@ -62,13 +62,11 @@ With **Yes**, additionally:
   (cloned at build time, copied from the ISO; `/etc/sddm.conf` -> `[Theme] Current=sddm-slice`);
   theme deps `qt6-5compat`, `qt6-virtualkeyboard`, `ttf-roboto`; `xorg-server` for sddm's X11 greeter.
 - `hyprland`, `hyprpm` (+ `ninja`, for building plugins) (+ portal, hyprlock, hypridle, qt wayland, wl-clipboard, playerctl, brightnessctl, swaybg),
-  and the dots' `hypr` directory -> `~/.config/hypr`.
+  (the dots' `hypr` directory is NOT copied).
 - `kitty`, `dolphin` (pacman, network) and `brave-bin` (chaotic-aur, network).
 
 All sddm/hyprland packages and the theme are cached in the ISO (offline repo), so the ISO grows by
 roughly a gigabyte. Built with `-n` they are downloaded instead.
-Note: the dots' hypr config launches tools not installed here (quickshell `qs`, rofi, hy3 plugin, ...)
-and has some hard-coded `/home/imfl/...` paths.
 
 sddm-slice fix: the theme ships Qt6 imports but no `QtVersion` in `metadata.desktop`, so SDDM started the
 Qt5 greeter ("Library import requires a version") and fell back to the default theme. build-iso patches the
@@ -77,9 +75,11 @@ staged theme (`QtVersion=6`) and blitzinstall re-checks it when copying the them
 ### Dark theme (GUI option only)
 
 GTK 3/4: Adwaita-dark (`gnome-themes-extra`, `settings.ini`, `GTK_THEME=Adwaita:dark`, dconf default `prefer-dark`
-+ `xdg-desktop-portal-gtk` settings portal). Qt6: `qt6ct` (Fusion + `darker` palette, `QT_QPA_PLATFORMTHEME=qt6ct`).
-KDE apps (dolphin): `~/.config/kdeglobals` = BreezeDark + `breeze-dark` icons. Env vars live in `/etc/profile.d/blitzart-dark.sh`
-and `/etc/environment`. Qt5-only apps follow the KDE/GTK settings where they can (no qt5ct).
++ `xdg-desktop-portal-gtk` settings portal). Qt6 and KDE apps (dolphin): platform theme `kde`
+(`plasma-integration`, `QT_QPA_PLATFORMTHEME=kde`) reading `~/.config/kdeglobals` = BreezeDark + Breeze style + `breeze-dark` icons.
+The dots' hypr `env.lua` also sets `QT_QPA_PLATFORMTHEME=kde`, which only works when `plasma-integration` is installed
+(without it Qt silently falls back to the light default). `/usr/local/bin/dolphin` is a tiny wrapper that guarantees the env.
+Image formats for thumbnails: `libheif`, `libavif`, `kimageformats`.
 
 ### Cursor (GUI option only)
 
@@ -87,3 +87,40 @@ Bibata-Modern-Classic (regular, size 24) for Wayland, X11 and XWayland. It is AU
 release tarball into the ISO (cached in /var/cache/blitzart-build/bibata) and blitzinstall unpacks it to
 `/usr/share/icons`. Set via `XCURSOR_THEME`/`XCURSOR_SIZE` (`/etc/profile.d/blitzart-cursor.sh`, `/etc/environment`),
 `/usr/share/icons/default/index.theme` (X11 fallback), GTK `settings.ini` and a dconf default.
+
+
+## illogical-impulse + end4-pC (GUI option only)
+
+With the graphical option the installer sets up end-4's **illogical-impulse** the way its own installer does
+(`curl -s https://ii.clsty.link/get` clones `end-4/dots-hyprland` into `~/.cache/dots-hyprland` and runs `./setup install`),
+except that everything it can is already inside the ISO:
+
+- **In the ISO:** `end-4/dots-hyprland` (with submodules), `pctrade/end4-pC`, your dots (incl. `hypr/`), and an offline repo with
+  every ii dependency that exists in the Artix/Arch repos, plus the prebuilt AUR ones that chaotic-aur has (cached at build time
+  with an isolated keyring, signatures verified). The package lists are read from ii's own `sdata/dist-arch/*/PKGBUILD`.
+- **At install time:** `./setup install --force --skip-sysupdate --skip-plasmaintg --skip-fish --skip-allsetups`
+  runs as your user in the target. It still needs the network for what cannot be cached: `quickshell` and `microtex`
+  (built from git by ii's PKGBUILDs), AUR leftovers (e.g. fonts), Google Sans Flex, the python venv (`uv`).
+  `ii`'s setups step needs a running init, so its dinit equivalents are applied directly (i2c group + module, ydotool and
+  bluetooth services, user services).
+- **Priority:** your dots are applied LAST, over ii's: `kitty`, `fastfetch`, `eza`, `starship.toml`, `.zshrc` replace ii's,
+  and your `hypr/` is MERGED over ii's (your files win; files only ii ships, such as
+  `custom/scripts/__restore_video_wallpaper.sh`, stay).
+- **end4-pC:** extracted to `~/.config/quickshell/end4-pC` AFTER ii (ii's file step does `rsync --delete` on all of
+  `~/.config/quickshell`). Your `hypr` starts it with `qs -c ~/.config/quickshell/end4-pC/`.
+- If ii's installer fails, the install continues with a warning; re-run `cd ~/.cache/dots-hyprland && ./setup install`.
+
+## Install order and why
+
+Everything that comes from the ISO's offline repo is installed first (older, but consistent with each other):
+base system, then (graphical option) SDDM/Hyprland and illogical-impulse dependencies. Only then does
+`phase_upgrade` run a full `pacman -Syu`, and only after that are network-only packages installed
+(`paru`, kitty, dolphin, brave) and ii's own installer run. This avoids partial upgrades (old base + fresh Qt/KF6).
+
+- Snapshots: the "BlitzArt fresh install" baseline has no cleanup algorithm and `important=yes`, so snapper's
+  number cleanup never removes it; `blitz snapshot prune` skips it too (delete it explicitly if you really want to).
+- Dual-boot: `os-prober` is installed and enabled in GRUB (GRUB_DISABLE_OS_PROBER=false). It adds a few seconds
+  to every `grub-mkconfig`, including the ones grub-btrfsd triggers after each snapshot.
+- Disk picker: lists real disks by TYPE (virtio disks are no longer hidden) and warns if you pick the live medium.
+- `linux-headers` for every selected kernel are installed (DKMS).
+- [blackarch] uses the default SigLevel; `blackarch-keyring` is installed after the upgrade.

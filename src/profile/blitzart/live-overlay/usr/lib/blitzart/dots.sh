@@ -27,12 +27,14 @@ blitzart_apply_dots() {
     return 0
 }
 
-# blitzart_apply_hypr <home> [owner]  - only used when the graphical option is selected
+# blitzart_apply_hypr <home> [owner]  - only used by the graphical option.
+# MERGES the dots' hypr directory over ~/.config/hypr: the user's files win, files that only illogical-impulse
+# ships (e.g. custom/scripts/__restore_video_wallpaper.sh, which the hypr config calls) are kept.
 blitzart_apply_hypr() {
     local h=$1 owner=${2:-}
     [[ -d $BA_DOTS/hypr ]] || return 0
-    mkdir -p "$h/.config"
-    rm -rf "$h/.config/hypr"; cp -r "$BA_DOTS/hypr" "$h/.config/hypr"
+    mkdir -p "$h/.config/hypr"
+    cp -a "$BA_DOTS/hypr/." "$h/.config/hypr/"
     [[ -n $owner ]] && chown -R "$owner" "$h/.config/hypr" 2>/dev/null
     return 0
 }

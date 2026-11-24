@@ -96,7 +96,7 @@ booted_snapshot_id() {
 
 # Table of snapshots, newest first. Fields (SEP separated): id type pre date cleanup description
 snap_rows() {
-    snapper -c "$SNAPPER_CFG" list --columns number,type,pre-number,date,cleanup,description 2>/dev/null \
+    snapper --table-style 0 -c "$SNAPPER_CFG" list --columns number,type,pre-number,date,cleanup,description 2>/dev/null \
     | awk -F'|' '
         NF >= 6 {
             id = $1; gsub(/[^0-9]/, "", id)
@@ -190,6 +190,7 @@ prune_snapshots() {
         IFS=$SEP read -r id type pre date cleanup desc <<<"$row"
         [[ $type == post ]] && continue
         [[ $id == "$booted" ]] && continue
+        [[ $desc == "BlitzArt fresh install" ]] && continue   # the rollback point from the installer
         [[ $desc =~ $re ]] || continue
         n=$((n+1))
         (( n > keep )) && victims+=("$id")
@@ -1078,7 +1079,7 @@ health_system() {
         else hres system ok "No kernel errors in dmesg"; fi
     fi
 
-    if pgrep -x -f 'chronyd|ntpd|openntpd|ntpd-rs|systemd-timesyncd|sntpd' >/dev/null 2>&1; then hres system ok "Time synchronisation daemon running"
+    if pgrep -x 'chronyd|ntpd|openntpd|ntpd-rs|systemd-timesyn|sntpd' >/dev/null 2>&1; then hres system ok "Time synchronisation daemon running"
     else hres system warn "No time synchronisation daemon found (chrony/ntpd)"; fi
 
     if [[ -n $(swapon --noheadings --show=NAME 2>/dev/null) ]]; then hres system ok "Swap/zram active"

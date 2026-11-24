@@ -77,9 +77,35 @@ ensure_net() {
 }
 
 # ---------------------------------------------------------------- menu pickers
+# real disks only. Filter by TYPE, not by major number: virtio disks (vda) use a dynamic major (often 252/253),
+# which the old `-e 7,11,252` hid; zram also reports TYPE=disk, so it is dropped by name.
+list_disks() {
+    lsblk -dpno NAME,SIZE,TYPE,MODEL 2>/dev/null | awk '
+        $3 == "disk" && $1 !~ /\/(zram|loop|ram)[0-9]*$/ {
+            n=$1; sz=$2; $1=$2=$3=""; sub(/^ +/, ""); gsub(/ +/, " ")
+            printf "%s\t%s\t%s\n", n, sz, $0
+        }'
+}
+
+# the disk this live system booted from (empty if not found)
+live_disk() {
+    local src p
+    src=$(findmnt -no SOURCE /run/artix/bootmnt 2>/dev/null) \
+        || src=$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null) || src=""
+    [[ -n $src ]] || src=$(findmnt -rno SOURCE -t iso9660,udf 2>/dev/null | head -n1)
+    [[ -n $src ]] || return 0
+    p=$(lsblk -no PKNAME "$src" 2>/dev/null | head -n1)
+    [[ -n $p ]] || p=${src##*/}
+    echo "$p"
+}
+
 pick_disk() {
-    local items=() n s m
-    while read -r n s m; do items+=("$n" "$s ${m:-}"); done < <(lsblk -dpno NAME,SIZE,MODEL -e 7,11,252 | sed 's/  */ /')
+    local items=() n s m live
+    live=$(live_disk)
+    while IFS=$'\t' read -r n s m; do
+        [[ -n $live && $n == "/dev/$live" ]] && m="$m  <-- LIVE MEDIUM"
+        items+=("$n" "$s ${m:-}")
+    done < <(list_disks)
     ((${#items[@]})) || { msgbox "No disks found."; return 1; }
     DLG --stdout --title "Disk" --menu "Select the installation disk:" 18 70 8 "${items[@]}"
 }
@@ -97,6 +123,10 @@ cfg_disk() {
         auto   "Wipe the whole disk and partition automatically" \
         manual "Use existing GPT partitions") || return
     d=$(pick_disk) || return
+    local live; live=$(live_disk)
+    if [[ -n $live && $d == "/dev/$live" ]]; then
+        yesno "$d is the medium this live system booted from.\nInstalling there destroys the running live system.\n\nContinue anyway?" "Live medium" || return
+    fi
     if [[ $mode == manual ]]; then
         if [[ $(lsblk -dno PTTYPE "$d") != gpt ]]; then
             msgbox "$d does not have a GPT partition table.\nBlitzArt requires GPT. Use automatic mode or convert the disk first."
@@ -166,9 +196,10 @@ cfg_gui() {
     if DLG --title "Graphical stuff (EXPERIMENTAL)" --defaultno --yesno \
 "Install the graphical stack?\n
   - SDDM (theme: sddm-slice), enabled at boot
-  - Hyprland + ~/.config/hypr from the dots
+  - Hyprland + illogical-impulse (end-4) + end4-pC
+  - your hypr config on top of it
   - kitty, dolphin, brave (downloaded)\n
-This is experimental. Choose No for the plain console system." 15 66; then
+This is experimental. Choose No for the plain console system." 17 66; then
         GUI=1
     else
         GUI=0
@@ -218,7 +249,7 @@ validate() {
     [[ -n $USER_NAME ]] || miss+=("user account")
     if ((${#miss[@]})); then msgbox "Still missing: ${miss[*]}"; return 1; fi
     local summary="Disk:     $DISK ($PART_MODE)\nHostname: $HOSTNAME_V\nKernels:  ${KERNELS[*]}\nUser:     $USER_NAME\nTimezone: $TZ_V\nLocale:   $LOCALE_V / $KEYMAP_V"
-    ((GUI)) && summary+="\nGraphical: Yes (EXPERIMENTAL: SDDM + Hyprland + kitty, dolphin, brave)"
+    ((GUI)) && summary+="\nGraphical: Yes (EXPERIMENTAL: SDDM, Hyprland, illogical-impulse, end4-pC, kitty, dolphin, brave)"
     if [[ $PART_MODE == auto ]]; then
         summary+="\n\n!! ALL DATA ON $DISK WILL BE DESTROYED (blkdiscard + new GPT) !!"
     else
@@ -308,6 +339,7 @@ phase_base() {
     local pkgs=("${BA_BASE_PKGS[@]}" "${BA_TOOLS_PKGS[@]}" "${KERNELS[@]}")
     # shellcheck disable=SC2206
     pkgs+=($EXTRA_PKGS)
+    local k; for k in "${KERNELS[@]}"; do pkgs+=("$k-headers"); done   # DKMS needs them
     msg "Installing base system (${#pkgs[@]} packages)"
     basestrap -C "$conf" "$MNT" "${pkgs[@]}" || die "basestrap failed"
 
@@ -443,7 +475,7 @@ EOF
     for s in dbus elogind NetworkManager acpid cronie chronyd dinit-user-spawn grub-btrfsd; do enable_svc "$s"; done
 }
 
-phase_repos() { # chaotic-aur + blackarch (network), then paru
+phase_repos() { # chaotic-aur + blackarch: keys and pacman.conf entries only (the upgrade is phase_upgrade)
     msg "Adding chaotic-aur and blackarch"
     ach pacman-key --init >/dev/null 2>&1
     ach pacman-key --populate artix archlinux >/dev/null 2>&1
@@ -459,19 +491,30 @@ phase_repos() { # chaotic-aur + blackarch (network), then paru
         warn "chaotic-aur setup failed - add it later"
     fi
 
-    # blackarch
+    # blackarch: default SigLevel (Required DatabaseOptional). The master key is locally signed; the rest of
+    # the keys arrive with blackarch-keyring (installed in phase_upgrade).
     local ba_fpr=4345771566D76038C7FEB43863EC0ADBEA87E4E3
     if ach pacman-key --recv-key "$ba_fpr" --keyserver keyserver.ubuntu.com \
        && ach pacman-key --lsign-key "$ba_fpr"; then
         cat >"$MNT/etc/pacman.d/blackarch-mirrorlist" <<'EOF'
 Server = https://blackarch.org/blackarch/$repo/os/$arch
 EOF
-        printf '\n[blackarch]\nSigLevel = Optional TrustAll\nInclude = /etc/pacman.d/blackarch-mirrorlist\n' >>"$MNT/etc/pacman.conf"
+        printf '\n[blackarch]\nInclude = /etc/pacman.d/blackarch-mirrorlist\n' >>"$MNT/etc/pacman.conf"
     else
         warn "blackarch setup failed - add it later"
     fi
+}
 
-    ach pacman -Sy --noconfirm || warn "pacman -Sy failed"
+# Everything that comes from the ISO's offline repo is installed BEFORE this (older, but consistent with each
+# other). Only then is the whole system brought up to date, so a later `pacman -S <net package>` can never mix
+# fresh libraries with old ones (a partial upgrade: Qt/KF6 for dolphin, mesa, ...).
+phase_upgrade() {
+    msg "Upgrading the system (the offline repo is older than the mirrors)"
+    ach pacman -Syu --noconfirm || warn "pacman -Syu failed - run it after the first boot"
+    if grep -q '^\[blackarch\]' "$MNT/etc/pacman.conf"; then
+        { ach pacman -S --noconfirm --needed blackarch-keyring && ach pacman-key --populate blackarch; } \
+            || warn "blackarch-keyring failed - [blackarch] packages will fail signature checks until you fix the keyring"
+    fi
     if grep -q '^\[chaotic-aur\]' "$MNT/etc/pacman.conf"; then
         ach pacman -S --noconfirm --needed paru || warn "paru not installed"
     fi
@@ -482,10 +525,10 @@ gui_dark_theme() { # EXPERIMENTAL GUI only: dark theme for GTK, Qt6 and KDE apps
     # system-wide: Qt platform theme + dark GTK (login sessions source /etc/profile.d; /etc/environment via PAM)
     mkdir -p "$MNT/etc/profile.d"
     cat >"$MNT/etc/profile.d/blitzart-dark.sh" <<'EOF'
-export QT_QPA_PLATFORMTHEME=qt6ct
+export QT_QPA_PLATFORMTHEME=kde
 export GTK_THEME=Adwaita:dark
 EOF
-    printf 'QT_QPA_PLATFORMTHEME=qt6ct\nGTK_THEME=Adwaita:dark\n' >>"$MNT/etc/environment"
+    printf 'QT_QPA_PLATFORMTHEME=kde\nGTK_THEME=Adwaita:dark\n' >>"$MNT/etc/environment"
 
     # dconf system default (GTK4 / libadwaita / xdg-desktop-portal-gtk settings portal)
     mkdir -p "$MNT/etc/dconf/profile" "$MNT/etc/dconf/db/local.d"
@@ -499,7 +542,7 @@ EOF
     ach dconf update 2>/dev/null || warn "dconf update failed (GTK4 dark default may be missing)"
 
     for home in "$MNT/etc/skel" "$MNT/home/$u"; do
-        mkdir -p "$home/.config/gtk-3.0" "$home/.config/gtk-4.0" "$home/.config/qt6ct"
+        mkdir -p "$home/.config/gtk-3.0" "$home/.config/gtk-4.0"
         cat >"$home/.config/gtk-3.0/settings.ini" <<'EOF'
 [Settings]
 gtk-application-prefer-dark-theme=1
@@ -511,23 +554,26 @@ EOF
 gtk-application-prefer-dark-theme=1
 gtk-icon-theme-name=Adwaita
 EOF
-        cat >"$home/.config/qt6ct/qt6ct.conf" <<'EOF'
-[Appearance]
-color_scheme_path=/usr/share/qt6ct/colors/darker.conf
-custom_palette=true
-icon_theme=breeze-dark
-standard_dialogs=default
-style=Fusion
-EOF
         # KDE apps (dolphin) read their colours from kdeglobals
         if [[ -f $MNT/usr/share/color-schemes/BreezeDark.colors ]]; then
             cp "$MNT/usr/share/color-schemes/BreezeDark.colors" "$home/.config/kdeglobals"
-            printf '\n[Icons]\nTheme=breeze-dark\n' >>"$home/.config/kdeglobals"
+            printf '\n[Icons]\nTheme=breeze-dark\n\n[KDE]\nwidgetStyle=Breeze\n' >>"$home/.config/kdeglobals"
         else
             warn "BreezeDark.colors not found - dolphin will not get the dark scheme"
         fi
     done
-    info "dark theme configured (GTK, Qt6, KDE)"
+    # Dolphin wrapper: guarantees the dark platform theme even when the session did not inherit
+    # /etc/profile.d (menu entries and keybindings call plain `dolphin`; /usr/local/bin comes first in PATH)
+    mkdir -p "$MNT/usr/local/bin"
+    cat >"$MNT/usr/local/bin/dolphin" <<'EOF'
+#!/bin/sh
+export QT_QPA_PLATFORMTHEME="${QT_QPA_PLATFORMTHEME:-kde}"
+export XCURSOR_THEME="${XCURSOR_THEME:-Bibata-Modern-Classic}"
+export XCURSOR_SIZE="${XCURSOR_SIZE:-24}"
+exec /usr/bin/dolphin "$@"
+EOF
+    chmod 755 "$MNT/usr/local/bin/dolphin"
+    info "dark theme configured (GTK, Qt6/KDE via plasma-integration)"
 }
 
 gui_cursor_theme() { # EXPERIMENTAL GUI only: Bibata-Modern-Classic for Wayland, X11 and XWayland
@@ -599,10 +645,11 @@ phase_gui() { # EXPERIMENTAL: only runs when GUI=1; with GUI=0 the install is un
     gui_dark_theme "$u"
     gui_cursor_theme "$u"
 
-    # Hyprland config from the dots
-    blitzart_apply_hypr "$MNT/home/$u"
     ach chown -R "$u:$u" "/home/$u"
+}
 
+phase_gui_net() { # EXPERIMENTAL: after the full upgrade
+    ((GUI)) || return 0
     # kitty, dolphin: network; brave: chaotic-aur
     ach pacman -S --noconfirm --needed "${BA_GUI_NET_PKGS[@]}" || warn "could not install: ${BA_GUI_NET_PKGS[*]}"
     if grep -q '^\[chaotic-aur\]' "$MNT/etc/pacman.conf"; then
@@ -610,6 +657,106 @@ phase_gui() { # EXPERIMENTAL: only runs when GUI=1; with GUI=0 the install is un
     else
         warn "chaotic-aur is not configured - brave was not installed (run: sudo pacman -S brave-bin later)"
     fi
+}
+
+# ---- illogical-impulse (end-4/dots-hyprland) + end4-pC ------------------------------------------------
+# Prebuilt AUR packages cached from chaotic-aur at ISO build time: installed from the ISO through a temporary
+# local repo inside the target (the chaotic key was trusted by phase_repos).
+ii_cached_aur_packages() {
+    ((${#BA_II_CHAOTIC_PKGS[@]})) && [[ -d $REPO_DIR ]] || return 0
+    if ! grep -q '^\[chaotic-aur\]' "$MNT/etc/pacman.conf"; then
+        warn "chaotic-aur is not configured - the AUR dependencies will be built by yay instead"
+        return 0
+    fi
+    local conf=$MNT/etc/pacman.conf p
+    cp "$conf" "$conf.blitzart-bak"
+    mkdir -p "$MNT/opt/blitzart/repo"
+    mount --bind "$REPO_DIR" "$MNT/opt/blitzart/repo" || { warn "cannot expose the offline repo"; rm -f "$conf.blitzart-bak"; return 0; }
+    sed -i '0,/^\[system\]/s||[blitzart-local]\nSigLevel = Required DatabaseOptional\nServer = file:///opt/blitzart/repo\n\n[system]|' "$conf"
+    ach pacman -Sy --noconfirm >/dev/null 2>&1 || warn "pacman -Sy failed"
+    for p in "${BA_II_CHAOTIC_PKGS[@]}"; do
+        ach pacman -S --noconfirm --needed "$p" || warn "not installed from the ISO cache: $p"
+    done
+    mv "$conf.blitzart-bak" "$conf"
+    umount "$MNT/opt/blitzart/repo" 2>/dev/null; rmdir "$MNT/opt/blitzart/repo" "$MNT/opt/blitzart" 2>/dev/null
+    rm -f "$MNT/var/lib/pacman/sync/blitzart-local.db"
+}
+
+# What ii's sdata/subcmd-install/2.setups.sh does on dinit. Its own version needs a RUNNING dinit
+# (dinitctl enable ...), which a chroot does not have, so the same effects are written directly.
+ii_dinit_setups() {
+    local u=$1 s
+    ach getent group i2c >/dev/null 2>&1 || ach groupadd i2c
+    ach usermod -aG video,i2c,input "$u"
+    grep -qx i2c-dev "$MNT/etc/modules" 2>/dev/null || echo i2c-dev >>"$MNT/etc/modules"
+    mkdir -p "$MNT/var/log/dinit" "$MNT/etc/dinit.d"
+    cat >"$MNT/etc/dinit.d/ydotool" <<'EOF'
+type = process
+command = /usr/bin/ydotoold
+logfile = /var/log/dinit/ydotool.log
+depends-on = dbus
+smooth-recovery = true
+EOF
+    for s in bluetoothd ydotool; do enable_svc "$s"; done
+}
+
+phase_ii_offline() { # EXPERIMENTAL: what comes from the ISO's offline repo (runs BEFORE the full upgrade)
+    ((GUI)) || return 0
+    [[ -f $SHARE/dots-hyprland.tar.xz ]] || return 0
+    msg "Installing illogical-impulse dependencies (from the ISO)"
+    # 1) official dependencies from the offline repo (verified with the live keyring)
+    if ((${#BA_II_PKGS[@]})); then
+        basestrap -C /tmp/blitzart-pacman.conf "$MNT" "${BA_II_PKGS[@]}" \
+            || warn "some illogical-impulse dependencies failed to install (ii will retry them)"
+    fi
+    # 2) prebuilt AUR dependencies cached in the ISO
+    ii_cached_aur_packages
+}
+
+phase_ii() { # EXPERIMENTAL, graphical option only (runs AFTER the full upgrade)
+    ((GUI)) || return 0
+    local u=$USER_NAME h=$MNT/home/$USER_NAME rc
+    if [[ ! -f $SHARE/dots-hyprland.tar.xz ]]; then
+        warn "dots-hyprland is missing from this ISO - skipping illogical-impulse"
+        return 0
+    fi
+    msg "Installing illogical-impulse (bundled in the ISO)"
+
+    # 3) the repo exactly where ii's own `get` script would put it (also lets you `git pull` + `./setup install` later)
+    mkdir -p "$h/.cache/dots-hyprland"
+    tar -xJf "$SHARE/dots-hyprland.tar.xz" -C "$h/.cache/dots-hyprland" \
+        || { warn "cannot unpack dots-hyprland"; return 0; }
+    ach chown -R "$u:$u" "/home/$u/.cache"
+
+    # 4) run the official installer: dependencies (yay + PKGBUILDs: quickshell, microtex, AUR leftovers) + config files.
+    #    Setups are replicated below (needs a running dinit). `x()` in ii asks [R/e/i] when a command fails and
+    #    would loop forever without a terminal, so it is answered with "i" (ignore); a time limit guards the rest.
+    install -Dm440 /dev/stdin "$MNT/etc/sudoers.d/99-blitzart-install" <<<"$u ALL=(ALL:ALL) NOPASSWD: ALL"
+    yes i 2>/dev/null | timeout 4h artix-chroot "$MNT" runuser -l "$u" -c \
+        'cd ~/.cache/dots-hyprland && ./setup install --force --skip-sysupdate --skip-plasmaintg --skip-fish --skip-allsetups'
+    rc=${PIPESTATUS[1]}
+    rm -f "$MNT/etc/sudoers.d/99-blitzart-install"
+    ((rc == 0)) || warn "the illogical-impulse installer exited with $rc (see the log); re-run it later: cd ~/.cache/dots-hyprland && ./setup install"
+
+    # 5) end4-pC AFTER ii: ii's files step rsyncs --delete over the whole ~/.config/quickshell
+    mkdir -p "$h/.config/quickshell/end4-pC"
+    tar -xJf "$SHARE/end4-pC.tar.xz" -C "$h/.config/quickshell/end4-pC" || warn "cannot unpack end4-pC"
+
+    # 6) dinit equivalents of ii's setups + the python venv (network: uv fetches python 3.12 and the wheels)
+    ii_dinit_setups "$u"
+    artix-chroot "$MNT" runuser -l "$u" -c '
+        export UV_NO_MODIFY_PATH=1
+        V=$HOME/.local/state/quickshell/.venv
+        mkdir -p "$V"
+        uv venv --prompt .venv "$V" -p 3.12 || true
+        . "$V/bin/activate" && uv pip install -r "$HOME/.cache/dots-hyprland/sdata/uv/requirements.txt"
+    ' || warn "the python venv for the shell could not be created (run ii's ./setup install-setups later)"
+
+    # 7) priority: the user's dots (kitty, fastfetch, eza, starship, .zshrc, hypr) are applied LAST, over ii's
+    blitzart_apply_dots "$h"
+    blitzart_apply_hypr "$h"
+    ach chown -R "$u:$u" "/home/$u"
+    info "illogical-impulse + end4-pC installed; your dots were applied on top"
 }
 
 phase_boot() {
@@ -623,14 +770,14 @@ phase_boot() {
     sed -i -E \
         -e 's|^GRUB_DISTRIBUTOR=.*|GRUB_DISTRIBUTOR="BlitzArt"|' \
         -e 's|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 quiet"|' \
-        -e 's|^#?GRUB_DISABLE_OS_PROBER=.*|GRUB_DISABLE_OS_PROBER=true|' "$g"
+        -e 's|^#?GRUB_DISABLE_OS_PROBER=.*|GRUB_DISABLE_OS_PROBER=false|' "$g"
     grub_set() { # key value - replace (also if commented out) or append
         if grep -qE "^#?$1=" "$g"; then sed -i -E "s|^#?$1=.*|$1=$2|" "$g"; else echo "$1=$2" >>"$g"; fi
     }
     grub_set GRUB_TIMEOUT -1          # menu stays until a choice is made
     grub_set GRUB_TIMEOUT_STYLE menu  # always show the menu
     grep -q '^GRUB_DISTRIBUTOR=' "$g" || echo 'GRUB_DISTRIBUTOR="BlitzArt"' >>"$g"
-    grep -q '^GRUB_DISABLE_OS_PROBER=' "$g" || echo 'GRUB_DISABLE_OS_PROBER=true' >>"$g"
+    grep -q '^GRUB_DISABLE_OS_PROBER=' "$g" || echo 'GRUB_DISABLE_OS_PROBER=false' >>"$g"
 
     ach mkinitcpio -P >/dev/null 2>&1 || warn "mkinitcpio -P reported problems"
     ach grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=BlitzArt --recheck \
@@ -638,7 +785,7 @@ phase_boot() {
              ach grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --recheck || die "grub-install failed"; }
 
     msg "Creating baseline snapshot"
-    ach snapper --no-dbus -c root create -t single -c number -d "BlitzArt fresh install" \
+    ach snapper --no-dbus -c root create -t single -u important=yes -d "BlitzArt fresh install" \
         || warn "could not create the baseline snapshot"
 
     ach grub-mkconfig -o /boot/grub/grub.cfg || die "grub-mkconfig failed"
@@ -649,7 +796,11 @@ do_install() {
     phase_base
     phase_configure
     phase_repos
-    phase_gui
+    phase_gui          # offline repo
+    phase_ii_offline   # offline repo
+    phase_upgrade      # full upgrade, only now
+    phase_gui_net
+    phase_ii
     phase_boot
     sync
     msg "Installation finished"
