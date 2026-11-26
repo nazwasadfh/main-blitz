@@ -124,3 +124,22 @@ base system, then (graphical option) SDDM/Hyprland and illogical-impulse depende
 - Disk picker: lists real disks by TYPE (virtio disks are no longer hidden) and warns if you pick the live medium.
 - `linux-headers` for every selected kernel are installed (DKMS).
 - [blackarch] uses the default SigLevel; `blackarch-keyring` is installed after the upgrade.
+
+## Pinned sources, BlackArch, ii, GRUB (notes)
+
+- **Pins.** oh-my-zsh, sddm-slice, dots-hyprland, end4-pC are fetched at an exact commit and the Bibata cursor at a tag
+  verified by sha256 (`PINS` block in `tools/build-iso.in`). `./build-iso --latest` ignores the pins. `tools/update-pins.sh`
+  shows newer upstream versions (`--write` applies them; then run `tools/bundle.sh`). Your own dots follow the branch head
+  unless `BLITZART_DOTS_REF=<full sha>` is set.
+- **Security.** `build-iso` runs as root but never sources third-party PKGBUILDs; dependency lists are read with a text parser.
+- **BlackArch.** Added the way the official `strap.sh` does it: keyring package + signature verified against the
+  published signer fingerprints, `pacman-key --populate blackarch`, then the repo with the default SigLevel.
+  If it fails the repo is skipped with a warning.
+- **illogical-impulse is interactive.** The installer is not auto-answered. If a command fails, ii's own prompt
+  (`R` repeat / `i` ignore / `e` exit) waits for you. Log: `/var/log/blitzart-ii.log`; a failure summary is printed
+  afterwards. To finish later: `cd ~/.cache/dots-hyprland && ./setup install`.
+- **GRUB_TIMEOUT=-1.** The boot menu waits for a keypress, so `blitz update --reboot` asks before rebooting (and refuses with `-y`).
+- **dinit services are best effort.** Service names (`chronyd`, `bluetoothd`, `NetworkManager`, ...) depend on the
+  `*-dinit` packages; verify on a real system.
+- **License.** `LICENSE` (MIT) covers BlitzArt's own scripts; see `THIRD-PARTY.md` for everything else.
+- **CI.** `.github/workflows/ci.yml` regenerates `build-iso` and fails if it differs from the committed one, then runs syntax checks and shellcheck.

@@ -1,0 +1,25 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build-iso must be regenerated from its sources
+        run: |
+          tools/bundle.sh
+          git diff --exit-code build-iso
+      - name: syntax
+        run: |
+          for f in build-iso tools/*.sh tools/build-iso.in src/data/blitz \
+                   src/profile/blitzart/live-overlay/usr/local/bin/blitzinstall \
+                   src/profile/blitzart/live-overlay/usr/lib/blitzart/*.sh; do
+            bash -n "$f"
+          done
+      - name: shellcheck
+        run: |
+          sudo apt-get install -y shellcheck
+          shellcheck -S warning tools/bundle.sh tools/update-pins.sh
+          shellcheck -S warning -s bash tools/build-iso.in src/data/blitz \
+            src/profile/blitzart/live-overlay/usr/local/bin/blitzinstall \
+            src/profile/blitzart/live-overlay/usr/lib/blitzart/*.sh

@@ -398,6 +398,33 @@ AUR/Flatpak, GRUB refresh and a post-update summary.
 EOF
 }
 
+# AUR step with its OWN pre/post pair. The pacman snapshot hook ignores transactions started by blitz, and the
+# repo pair is already closed (or never taken: `--only aur`) by the time paru/yay run - so without this the AUR
+# changes would never have a snapshot.
+update_aur() {
+    local helper="" pre=""
+    if [[ -z $REAL_USER || $REAL_USER == root ]]; then
+        warn "AUR: refusing to build packages as root. Run via sudo from a regular user account."; return 0
+    elif have paru; then helper=paru
+    elif have yay; then helper=yay
+    else warn "Neither paru nor yay found, skipping AUR."; return 0
+    fi
+    if (( DO_SNAPSHOT )) && root_is_btrfs && snapper_ok; then
+        msg "Creating pre-AUR snapshot (snapper)"
+        pre=$(snapper -c "$SNAPPER_CFG" create --type pre --print-number --cleanup-algorithm number -d "blitz update (AUR)") \
+            && info "Snapshot #$pre" || { warn "snapper snapshot failed."; pre=""; }
+    fi
+    msg "Updating AUR packages ($helper)"
+    sudo -u "$REAL_USER" "$helper" -Sua "${noconf[@]}" "${upflags[@]}" || warn "$helper reported errors."
+    if [[ -n $pre ]]; then
+        snapper -c "$SNAPPER_CFG" create --type post --pre-number "$pre" --cleanup-algorithm number -d "blitz update (AUR)" >/dev/null \
+            && info "Post-AUR snapshot created (pair of #$pre)" || warn "Post-AUR snapshot failed."
+    fi
+}
+
+# GRUB_TIMEOUT=-1 (the BlitzArt default): the boot menu waits for a keypress, an unattended reboot stops there
+grub_waits_forever() { grep -qE '^GRUB_TIMEOUT=-1[[:space:]]*$' /etc/default/grub 2>/dev/null; }
+
 cmd_update() {
     local DO_MIRRORS=0 DO_AUR=0 DO_FLATPAK=0 DO_CLEAN=0 DO_NEWS=0 DO_SNAPSHOT=1 DO_REPO=1
     local DRY=0 REBOOT=0 REBOOT_IF=0 KEEP=0 ROLLBACK=0 ONLY="" IGNORE=""
@@ -541,19 +568,7 @@ cmd_update() {
     fi
 
     # ---- AUR ----
-    if (( DO_AUR )); then
-        if [[ -z $REAL_USER || $REAL_USER == root ]]; then
-            warn "AUR: refusing to build packages as root. Run via sudo from a regular user account."
-        elif have paru; then
-            msg "Updating AUR packages (paru)"
-            sudo -u "$REAL_USER" paru -Sua "${noconf[@]}" "${upflags[@]}"
-        elif have yay; then
-            msg "Updating AUR packages (yay)"
-            sudo -u "$REAL_USER" yay -Sua "${noconf[@]}" "${upflags[@]}"
-        else
-            warn "Neither paru nor yay found, skipping AUR."
-        fi
-    fi
+    if (( DO_AUR )); then update_aur; fi
 
     # ---- Flatpak ----
     if (( DO_FLATPAK )); then
@@ -569,6 +584,13 @@ cmd_update() {
     notify "Update finished"
 
     if (( REBOOT )) || { (( REBOOT_IF )) && needs_reboot; }; then
+        if grub_waits_forever; then
+            warn "GRUB_TIMEOUT=-1: the boot menu waits for a keypress, so an unattended reboot would stop there."
+            if (( ASSUME_YES )) || ! ask "Reboot anyway?"; then
+                info "Not rebooting. Reboot by hand, or set a finite GRUB_TIMEOUT in /etc/default/grub (then run grub-mkconfig)."
+                return 0
+            fi
+        fi
         msg "Rebooting in 5 seconds (Ctrl+C to cancel)"; sleep 5; sync; reboot
     fi
 }
@@ -891,7 +913,20 @@ section_enabled() {
     [[ -n $H_SKIP && ",$H_SKIP," == *",$1,"* ]] && return 1
     return 0
 }
-json_esc() { local s=$1; s=${s//\\/\\\\}; s=${s//\"/\\\"}; printf '%s' "$s"; }
+json_esc() { # JSON string escaping, including every control character (U+0000-U+001F)
+    local s=$1 i c out=""
+    s=${s//\\/\\\\}; s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; s=${s//$'\t'/\\t}; s=${s//$'\b'/\\b}; s=${s//$'\f'/\\f}
+    if [[ $s == *[[:cntrl:]]* ]]; then
+        for (( i = 0; i < ${#s}; i++ )); do
+            c=${s:i:1}
+            if [[ $c == [[:cntrl:]] ]]; then printf -v c '\\u%04x' "'$c"; fi
+            out+=$c
+        done
+        s=$out
+    fi
+    printf '%s' "$s"
+}
 
 health_pkg() {
     local lock=/var/lib/pacman/db.lck out n k missing=()
@@ -1083,7 +1118,7 @@ health_system() {
     else hres system warn "No time synchronisation daemon found (chrony/ntpd)"; fi
 
     if [[ -n $(swapon --noheadings --show=NAME 2>/dev/null) ]]; then hres system ok "Swap/zram active"
-    else hres system warn "No swap or zram active"; fi
+    else hres system skip "No swap or zram configured (optional)"; fi
 
     mem_total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo); mem_avail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
     if [[ -n $mem_total && -n $mem_avail ]]; then

@@ -63,12 +63,13 @@ have_net() {
 }
 
 ensure_net() {
+    local choice
     while ! have_net; do
-        DLG --title "Network required" --menu "No internet connection.\nBlitzArt installs from the network." 12 62 3 \
+        choice=$(DLG --stdout --title "Network required" --menu "No internet connection.\nBlitzArt installs from the network." 12 62 3 \
             1 "Configure network (nmtui)" \
             2 "Retry" \
-            3 "Abort" 2>/tmp/.ba_net || { clear; exit 1; }
-        case $(</tmp/.ba_net) in
+            3 "Abort") || { clear; exit 1; }
+        case $choice in
             1) nmtui ;;
             2) ;;
             3) clear; exit 1 ;;
@@ -170,11 +171,25 @@ cfg_timezone() {
     TZ_V="$r/$c"
 }
 
+# exact match on the locale name (it never goes through a regex)
+# (only real locale lines count: "#xx_YY.UTF-8 UTF-8" or the uncommented form; "# comment" lines do not)
+locale_exists() { awk -v l="$1" '/^#[A-Za-z]/ { $0 = substr($0, 2) } /^[A-Za-z]/ && NF >= 2 && $1 == l { f = 1 } END { exit !f }' /etc/locale.gen; }
+
+# package names: split WITHOUT globbing, each token must look like a package name (never an option)
+valid_pkg_list() {
+    local -a words; local w
+    read -ra words <<<"$1"
+    for w in "${words[@]}"; do
+        [[ $w =~ ^[A-Za-z0-9@][A-Za-z0-9@._+-]*$ ]] || return 1
+    done
+}
+
 cfg_locale() {
     local l k
     l=$(input "Locale" "Locale (must exist in /etc/locale.gen):" "$LOCALE_V") || return
-    grep -qE "^#?${l//./\\.} " /etc/locale.gen || { msgbox "Unknown locale: $l"; return; }
+    locale_exists "$l" || { msgbox "Unknown locale: $l"; return; }
     k=$(input "Keymap" "Console keymap (e.g. us, pl, de-latin1):" "$KEYMAP_V") || return
+    [[ $k =~ ^[A-Za-z0-9._@-]+$ ]] || { msgbox "Invalid keymap name: $k"; return; }
     grep -q . < <(find /usr/share/kbd/keymaps -name "$k.map*" 2>/dev/null) || { msgbox "Unknown keymap: $k"; return; }
     LOCALE_V=$l; KEYMAP_V=$k
     loadkeys "$k" 2>/dev/null || true
@@ -230,11 +245,12 @@ main_menu() {
             1) local h; h=$(input "Hostname" "Hostname:" "$HOSTNAME_V") && [[ $h =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] && HOSTNAME_V=$h ;;
             2) cfg_disk ;;
             3) cfg_kernels ;;
-            4) ROOT_PW=$(password "Root password") || true ;;
+            4) local p; p=$(password "Root password") && ROOT_PW=$p ;;
             5) cfg_user ;;
             6) cfg_timezone ;;
             7) cfg_locale ;;
-            8) EXTRA_PKGS=$(input "Additional packages" "Extra packages (space separated, from any enabled repo):" "$EXTRA_PKGS") || true ;;
+            8) local x; x=$(input "Additional packages" "Extra packages (space separated, from any enabled repo):" "$EXTRA_PKGS") \
+                   && { valid_pkg_list "$x" && EXTRA_PKGS=$x || msgbox "Invalid package name. Allowed: letters, digits and @ . _ + - (no leading dash)."; } ;;
             9) cfg_gui ;;
             i) validate && return 0 ;;
             0) clear; exit 0 ;;
@@ -334,14 +350,13 @@ phase_base() {
     pacman-key --init >/dev/null 2>&1 || true
     pacman-key --populate artix archlinux >/dev/null 2>&1 || warn "keyring populate reported problems"
 
-    local conf=/tmp/blitzart-pacman.conf
-    write_install_conf "$conf"
+    write_install_conf "$PACCONF"
     local pkgs=("${BA_BASE_PKGS[@]}" "${BA_TOOLS_PKGS[@]}" "${KERNELS[@]}")
-    # shellcheck disable=SC2206
-    pkgs+=($EXTRA_PKGS)
+    local -a extra; read -ra extra <<<"$EXTRA_PKGS"
+    pkgs+=("${extra[@]}")
     local k; for k in "${KERNELS[@]}"; do pkgs+=("$k-headers"); done   # DKMS needs them
     msg "Installing base system (${#pkgs[@]} packages)"
-    basestrap -C "$conf" "$MNT" "${pkgs[@]}" || die "basestrap failed"
+    basestrap -C "$PACCONF" "$MNT" "${pkgs[@]}" || die "basestrap failed"
 
     msg "Generating fstab"
     fstabgen -U "$MNT" >"$MNT/etc/fstab"
@@ -404,7 +419,9 @@ EOF
 EOF
     ln -sf "/usr/share/zoneinfo/$TZ_V" "$MNT/etc/localtime"
     ach hwclock --systohc 2>/dev/null || true
-    sed -i -E "s/^#(${LOCALE_V//./\\.} )/\1/; s/^#(en_US\.UTF-8 )/\1/" "$MNT/etc/locale.gen"
+    awk -v l="$LOCALE_V" '
+        /^#[A-Za-z]/ { t = substr($0, 2); split(t, a, " "); if (a[1] == l || a[1] == "en_US.UTF-8") { print t; next } }
+        { print }' "$MNT/etc/locale.gen" >"$MNT/etc/locale.gen.new" && mv "$MNT/etc/locale.gen.new" "$MNT/etc/locale.gen"
     ach locale-gen >/dev/null
     echo "LANG=$LOCALE_V" >"$MNT/etc/locale.conf"
     echo "KEYMAP=$KEYMAP_V" >"$MNT/etc/vconsole.conf"
@@ -475,6 +492,58 @@ EOF
     for s in dbus elogind NetworkManager acpid cronie chronyd dinit-user-spawn grub-btrfsd; do enable_svc "$s"; done
 }
 
+# BlackArch, following https://blackarch.org/strap.sh: download blackarch-keyring and its signature, verify the
+# signature against the trusted signer keys, install the keyring and `pacman-key --populate blackarch`; the repo is
+# added only afterwards, with the DEFAULT SigLevel. Its packages are signed by several developer keys, which is what
+# the keyring provides - locally signing a single master key is not enough ("wrong key" errors).
+# Signers: KEYRING_SIGNERS of strap.sh ("keep in sync with blackarch-trusted").
+readonly BLACKARCH_SIGNERS="8F9A9793CB8591147C2EC70566E0CDBD1E01F333
+A0917C4147A37007CB54C1CFD295AA940EFDDF62
+4345771566D76038C7FEB43863EC0ADBEA87E4E3
+F9A6E68A711354D84A9B91637533BAFE69A25079"
+
+setup_blackarch() {
+    local script=$MNT/root/.blitzart-blackarch.sh rc
+    cat >"$script" <<'EOF'
+#!/bin/sh
+set -e
+ARCH=$(uname -m)
+repo="https://blackarch.org/blackarch/blackarch/os/$ARCH"
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT; cd "$tmp"
+curl -sfL -O "$repo/blackarch.db"
+PKG=$(bsdtar -xOf blackarch.db 'blackarch-keyring-*/desc' 2>/dev/null | awk '/^%FILENAME%$/ { getline; print; exit }')
+[ -n "$PKG" ] || { echo "blackarch-keyring not found in the repository database"; exit 1; }
+curl -sfL -O "$repo/$PKG"
+curl -sfL -O "$repo/$PKG.sig"
+# verify the signature in a throwaway keyring
+export GNUPGHOME="$tmp/gnupg"; mkdir -m 700 "$GNUPGHOME"
+for fpr in $BA_SIGNERS; do
+    for ks in keyserver.ubuntu.com hkps://keyserver.ubuntu.com:443 hkps://pgp.mit.edu; do
+        gpg --keyserver "$ks" --recv-keys "$fpr" >/dev/null 2>&1 && break
+    done
+done
+status=$(gpg --status-fd 1 --verify "$PKG.sig" "$PKG" 2>/dev/null || true)
+signer=$(printf '%s\n' "$status" | awk '$2 == "VALIDSIG" { print $NF }')
+gpgconf --kill all 2>/dev/null || true
+unset GNUPGHOME
+[ -n "$signer" ] || { echo "invalid signature on $PKG"; exit 1; }
+ok=0; for t in $BA_SIGNERS; do [ "$t" = "$signer" ] && ok=1; done
+[ "$ok" = 1 ] || { echo "$PKG is signed by an untrusted key: $signer"; exit 1; }
+# install the keyring
+mkdir pkg
+bsdtar -xf "$PKG" -C pkg usr/share/pacman/keyrings
+cp pkg/usr/share/pacman/keyrings/* /usr/share/pacman/keyrings/
+pacman-key --populate blackarch
+pacman -U --noconfirm --overwrite '/usr/share/pacman/keyrings/blackarch*' "$PKG"
+curl -sfL https://blackarch.org/blackarch-mirrorlist -o /etc/pacman.d/blackarch-mirrorlist
+EOF
+    chmod 700 "$script"
+    ach env BA_SIGNERS="$BLACKARCH_SIGNERS" sh /root/.blitzart-blackarch.sh
+    rc=$?
+    rm -f "$script"
+    return $rc
+}
+
 phase_repos() { # chaotic-aur + blackarch: keys and pacman.conf entries only (the upgrade is phase_upgrade)
     msg "Adding chaotic-aur and blackarch"
     ach pacman-key --init >/dev/null 2>&1
@@ -491,17 +560,11 @@ phase_repos() { # chaotic-aur + blackarch: keys and pacman.conf entries only (th
         warn "chaotic-aur setup failed - add it later"
     fi
 
-    # blackarch: default SigLevel (Required DatabaseOptional). The master key is locally signed; the rest of
-    # the keys arrive with blackarch-keyring (installed in phase_upgrade).
-    local ba_fpr=4345771566D76038C7FEB43863EC0ADBEA87E4E3
-    if ach pacman-key --recv-key "$ba_fpr" --keyserver keyserver.ubuntu.com \
-       && ach pacman-key --lsign-key "$ba_fpr"; then
-        cat >"$MNT/etc/pacman.d/blackarch-mirrorlist" <<'EOF'
-Server = https://blackarch.org/blackarch/$repo/os/$arch
-EOF
+    # blackarch: set up the way its own strap.sh does it (keyring first, then the repo with the default SigLevel)
+    if setup_blackarch; then
         printf '\n[blackarch]\nInclude = /etc/pacman.d/blackarch-mirrorlist\n' >>"$MNT/etc/pacman.conf"
     else
-        warn "blackarch setup failed - add it later"
+        warn "blackarch setup failed - the repo was NOT added (see https://blackarch.org/strap.sh to add it later)"
     fi
 }
 
@@ -511,10 +574,6 @@ EOF
 phase_upgrade() {
     msg "Upgrading the system (the offline repo is older than the mirrors)"
     ach pacman -Syu --noconfirm || warn "pacman -Syu failed - run it after the first boot"
-    if grep -q '^\[blackarch\]' "$MNT/etc/pacman.conf"; then
-        { ach pacman -S --noconfirm --needed blackarch-keyring && ach pacman-key --populate blackarch; } \
-            || warn "blackarch-keyring failed - [blackarch] packages will fail signature checks until you fix the keyring"
-    fi
     if grep -q '^\[chaotic-aur\]' "$MNT/etc/pacman.conf"; then
         ach pacman -S --noconfirm --needed paru || warn "paru not installed"
     fi
@@ -617,7 +676,7 @@ phase_gui() { # EXPERIMENTAL: only runs when GUI=1; with GUI=0 the install is un
     local u=$USER_NAME
 
     # sddm + hyprland + deps: from the offline repo on the ISO (basestrap -C = local repo first)
-    if ! basestrap -C /tmp/blitzart-pacman.conf "$MNT" "${BA_GUI_PKGS[@]}"; then
+    if ! basestrap -C "$PACCONF" "$MNT" "${BA_GUI_PKGS[@]}"; then
         warn "graphical packages failed to install - skipping the graphical setup"
         return 0
     fi
@@ -706,11 +765,25 @@ phase_ii_offline() { # EXPERIMENTAL: what comes from the ISO's offline repo (run
     msg "Installing illogical-impulse dependencies (from the ISO)"
     # 1) official dependencies from the offline repo (verified with the live keyring)
     if ((${#BA_II_PKGS[@]})); then
-        basestrap -C /tmp/blitzart-pacman.conf "$MNT" "${BA_II_PKGS[@]}" \
+        basestrap -C "$PACCONF" "$MNT" "${BA_II_PKGS[@]}" \
             || warn "some illogical-impulse dependencies failed to install (ii will retry them)"
     fi
     # 2) prebuilt AUR dependencies cached in the ISO
     ii_cached_aur_packages
+}
+
+ii_cleanup() { rm -f "$MNT/etc/sudoers.d/99-blitzart-install"; }
+
+# which of ii's commands failed (whether you repeated or ignored them) - read from its log
+ii_failure_summary() {
+    local log=$MNT/var/log/blitzart-ii.log clean n
+    [[ -f $log ]] || return 0
+    clean=$(sed 's/\x1b\[[0-9;]*m//g' "$log")
+    n=$(grep -c 'has failed\.' <<<"$clean") || true
+    ((n)) || return 0
+    warn "ii reported $n failed command(s):"
+    grep 'has failed\.' <<<"$clean" | sort | uniq -c | sort -rn | head -8 | sed 's/^/    /' >&2
+    warn "full log: /var/log/blitzart-ii.log; to finish later: cd ~/.cache/dots-hyprland && ./setup install"
 }
 
 phase_ii() { # EXPERIMENTAL, graphical option only (runs AFTER the full upgrade)
@@ -729,14 +802,22 @@ phase_ii() { # EXPERIMENTAL, graphical option only (runs AFTER the full upgrade)
     ach chown -R "$u:$u" "/home/$u/.cache"
 
     # 4) run the official installer: dependencies (yay + PKGBUILDs: quickshell, microtex, AUR leftovers) + config files.
-    #    Setups are replicated below (needs a running dinit). `x()` in ii asks [R/e/i] when a command fails and
-    #    would loop forever without a terminal, so it is answered with "i" (ignore); a time limit guards the rest.
+    #    It is INTERACTIVE on purpose: stdin stays the terminal, so when a command fails ii's own prompt
+    #    (R = repeat, i = ignore, e = exit) waits for YOU. Auto-answering does not work: several of its prompts are
+    #    `while true` loops that only accept specific answers and would repeat forever.
+    #    Setups are replicated below (they need a running dinit). Passwordless sudo exists only while this runs.
     install -Dm440 /dev/stdin "$MNT/etc/sudoers.d/99-blitzart-install" <<<"$u ALL=(ALL:ALL) NOPASSWD: ALL"
-    yes i 2>/dev/null | timeout 4h artix-chroot "$MNT" runuser -l "$u" -c \
-        'cd ~/.cache/dots-hyprland && ./setup install --force --skip-sysupdate --skip-plasmaintg --skip-fish --skip-allsetups'
-    rc=${PIPESTATUS[1]}
-    rm -f "$MNT/etc/sudoers.d/99-blitzart-install"
-    ((rc == 0)) || warn "the illogical-impulse installer exited with $rc (see the log); re-run it later: cd ~/.cache/dots-hyprland && ./setup install"
+    trap ii_cleanup EXIT
+    trap 'ii_cleanup; exit 130' INT TERM
+    mkdir -p "$MNT/var/log"; : >"$MNT/var/log/blitzart-ii.log"
+    msg "Running the illogical-impulse installer (log: /var/log/blitzart-ii.log on the new system)"
+    artix-chroot "$MNT" runuser -l "$u" -c \
+        'cd ~/.cache/dots-hyprland && ./setup install --force --skip-sysupdate --skip-plasmaintg --skip-fish --skip-allsetups' \
+        2>&1 | tee -a "$MNT/var/log/blitzart-ii.log"
+    rc=${PIPESTATUS[0]}
+    ii_cleanup; trap - EXIT INT TERM
+    ((rc == 0)) || warn "the illogical-impulse installer exited with $rc"
+    ii_failure_summary
 
     # 5) end4-pC AFTER ii: ii's files step rsyncs --delete over the whole ~/.config/quickshell
     mkdir -p "$h/.config/quickshell/end4-pC"
@@ -820,12 +901,16 @@ main_menu
 clear
 mkdir -p "$(dirname "$LOG")"
 set -o pipefail
+PACCONF=$(mktemp /tmp/blitzart-pacman.XXXXXX.conf)   # shared by the phases that run basestrap
 do_install 2>&1 | tee -a "$LOG"
 rc=${PIPESTATUS[0]}
+rm -f "$PACCONF"
 if ((rc != 0)); then
+    rm -f "$MNT/etc/sudoers.d/99-blitzart-install"
     echo; warn "Installation FAILED (log: $LOG). The target is still mounted at $MNT."
     exit "$rc"
 fi
+rm -f "$MNT/etc/sudoers.d/99-blitzart-install"
 umount -R "$MNT" 2>/dev/null || true
 if yesno "BlitzArt is installed.\nReboot now? (remove the installation medium)" "Done"; then
     clear; reboot

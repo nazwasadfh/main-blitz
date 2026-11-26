@@ -27,7 +27,20 @@ readonly CHAOTIC_GPG="/var/cache/blitzart-build/gnupg-chaotic"
 readonly II_EXTRA_PKGS=(yay uv rsync git base-devel bluez bluez-utils bluez-dinit power-profiles-daemon
     power-profiles-daemon-dinit networkmanager-dinit pipewire-dinit pipewire-pulse-dinit wireplumber-dinit
     easyeffects cliphist ydotool)
-readonly CURSOR_URL="https://github.com/ful1e5/Bibata_Cursor/releases/latest/download/Bibata-Modern-Classic.tar.xz"
+readonly CURSOR_REPO="https://github.com/ful1e5/Bibata_Cursor"
+
+# ---- pinned third-party sources: reproducible, reviewable builds (refresh with tools/update-pins.sh).
+# `./build-iso --latest` ignores the pins. The user's OWN dots (nazwasadfh/dots) follow the branch head by default,
+# because "always the newest" is the point there; set BLITZART_DOTS_REF=<full sha> to pin them too.
+# BEGIN PINS
+PIN_OMZ="799f9a8a8ae16e2b6a46dd3e9a9bd657bf614825"
+PIN_SDDM="98996b49e0d5657f94cc0cfb71480da76c83b008"
+PIN_II="21733c3ca7f4edc20faafedea844dc96002c6f7f"
+PIN_E4="a28f6f7035e785fc61eee6cc004f8508779a9776"
+PIN_BIBATA_TAG="v2.0.7"
+PIN_BIBATA_SHA256="7d3495864e5bbef02f5e77de760b2905903b63c71495a78ef6306d19a3b556d8"
+# END PINS
+readonly CHAOTIC_MAX_AGE_DAYS=30
 readonly STATE_DIR="/var/cache/blitzart-build"
 readonly MARK="# blitzart-managed"
 
@@ -45,20 +58,23 @@ Usage: ./build-iso [options]
   -q, --query            show what buildiso would do, build nothing
   -n, --no-offline-repo  do not cache packages in the ISO (installer downloads everything)
   -y, --yes              answer yes to prompts (move aside a foreign iso-profiles dir, ...)
+  --latest               ignore the commit/tag pins of third-party sources (use their newest versions)
   -h, --help             this help
 
 Environment:
   BLITZART_DOTS_URL      dots repository   (default: $DOTS_URL)
+  BLITZART_DOTS_REF      pin the dots to this full commit sha (default: branch head)
   WORKSPACE_DIR          artools workspace (default: ~/artools-workspace)
 EOF
 }
 
-QUERY=0; OFFLINE=1; YES=0
+QUERY=0; OFFLINE=1; YES=0; LATEST=0
 for a in "$@"; do
     case $a in
         -q|--query) QUERY=1 ;;
         -n|--no-offline-repo) OFFLINE=0 ;;
         -y|--yes) YES=1 ;;
+        --latest) LATEST=1 ;;
         -h|--help) usage; exit 0 ;;
         *) usage; die "unknown option: $a" ;;
     esac
@@ -114,8 +130,25 @@ extract_payload() {
     [[ -d $STAGE/profile/$PROFILE ]] || die "payload is missing the profile"
 }
 
-sync_repo() { # url dir label
-    local url=$1 dir=$2 label=$3
+pin() { ((LATEST)) && echo "" || echo "$1"; }
+
+sync_repo() { # url dir label [full-sha]
+    local url=$1 dir=$2 label=$3 ref=${4:-}
+    if [[ -n $ref ]]; then
+        [[ $ref =~ ^[0-9a-f]{40}$ ]] || die "invalid pin for $label: '$ref' (a full 40-character sha is required)"
+        if [[ -d $dir/.git ]] && [[ $(git -C "$dir" remote get-url origin 2>/dev/null) == "$url" ]] \
+           && [[ $(git -C "$dir" rev-parse HEAD 2>/dev/null) == "$ref" ]]; then
+            info "$label pinned at ${ref:0:8} (cached)"; return 0
+        fi
+        rm -rf "$dir"; mkdir -p "$dir"
+        git -C "$dir" init -q && git -C "$dir" remote add origin "$url" \
+            && git -C "$dir" fetch -q --depth 1 origin "$ref" \
+            && git -C "$dir" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD \
+            || die "cannot fetch $label at ${ref:0:8} from $url"
+        [[ $(git -C "$dir" rev-parse HEAD) == "$ref" ]] || die "$label: the fetched commit does not match the pin"
+        info "$label pinned at ${ref:0:8}"
+        return 0
+    fi
     if [[ -d $dir/.git ]] && [[ $(git -C "$dir" remote get-url origin 2>/dev/null) == "$url" ]]; then
         info "updating $label ($dir)"
         git -C "$dir" fetch --depth 1 origin HEAD -q && git -C "$dir" reset --hard FETCH_HEAD -q \
@@ -127,7 +160,7 @@ sync_repo() { # url dir label
         info "cloning $label"
         git clone --depth 1 -q "$url" "$dir" || die "cannot clone $url"
     fi
-    info "$label at $(git -C "$dir" rev-parse --short HEAD)"
+    info "$label at $(git -C "$dir" rev-parse --short HEAD) (NOT pinned)"
 }
 
 # ------------------------------------------------------------------ pacman configs
@@ -256,7 +289,8 @@ cache_packages() { # conf db dest pkg...
 
 # chaotic-aur for the BUILD only: an isolated keyring (artix + arch + chaotic), the host keyring is not touched
 setup_chaotic_dl() {
-    [[ -f $STATE_DIR/chaotic.ok ]] && return 0
+    # trust the key again every $CHAOTIC_MAX_AGE_DAYS days (keys get rotated/revoked), not forever
+    [[ -n $(find "$STATE_DIR/chaotic.ok" -mtime "-$CHAOTIC_MAX_AGE_DAYS" 2>/dev/null) ]] && return 0
     rm -rf "$CHAOTIC_GPG"; mkdir -p "$CHAOTIC_GPG"; chmod 700 "$CHAOTIC_GPG"
     pacman-key --gpgdir "$CHAOTIC_GPG" --init >/dev/null 2>&1 || return 1
     pacman-key --gpgdir "$CHAOTIC_GPG" --populate artix archlinux >/dev/null 2>&1 || return 1
@@ -313,11 +347,40 @@ build_offline_repo() { # $1 = destination dir
 # illogical-impulse (end-4/dots-hyprland): the Arch dependency lists are the `depends`/`makedepends` of the
 # meta-PKGBUILDs in sdata/dist-arch. Split them into: Artix/Arch repos (cached in the ISO), chaotic-aur
 # prebuilt AUR packages (cached in the ISO) and the rest (AUR/sources: fetched at install time by ii itself).
+# PKGBUILDs come from a third-party repo and build-iso runs as root: they are only READ here, never sourced.
 read_ii_depends() {
-    local d
-    for d in "$II_DIR"/sdata/dist-arch/illogical-impulse-*/; do
-        bash -c 'cd "$1" && source ./PKGBUILD >/dev/null 2>&1; printf "%s\n" "${depends[@]}" "${makedepends[@]}"' _ "$d"
+    local f prog
+    prog=$(mktemp)
+    cat >"$prog" <<'AWK'
+# Prints the names listed in depends=(...) / makedepends=(...) of a PKGBUILD WITHOUT executing anything.
+# An array that contains a command substitution ($( ) or backticks) is dropped as a whole, with a warning:
+# its contents cannot be known statically, and a partial list would be worse than none.
+function emit(tok) {
+    gsub(/^["\x27]|["\x27]$/, "", tok)
+    if (tok ~ /^[A-Za-z0-9@._+-]+([<>=][^ ]*)?$/) buf = buf tok "\n"
+    else if (tok != "") bad++
+}
+{
+    line = $0; sub(/#.*/, "", line)
+    if (!inarr) {
+        if (match(line, /^(depends|makedepends)\+?=\(/)) { inarr = 1; dyn = 0; buf = ""; bad = 0; line = substr(line, RLENGTH + 1) }
+        else next
+    }
+    if (line ~ /\$\(|`/) dyn = 1
+    if (!dyn && (idx = index(line, ")")) > 0) { line = substr(line, 1, idx - 1); done = 1 }
+    if (!dyn) { n = split(line, t, /[ \t]+/); for (i = 1; i <= n; i++) if (t[i] != "") emit(t[i]) }
+    if (!dyn && done) { printf "%s", buf; if (bad) skipped += bad; inarr = 0; done = 0 }
+    else if (dyn && line ~ /\)[ \t]*$/) { dropped++; inarr = 0; done = 0 }
+}
+END {
+    if (skipped) printf "build-iso: skipped %d non-literal dependency entries in %s\n", skipped, FILENAME > "/dev/stderr"
+    if (dropped) printf "build-iso: dropped %d dependency array(s) with command substitution in %s\n", dropped, FILENAME > "/dev/stderr"
+}
+AWK
+    for f in "$II_DIR"/sdata/dist-arch/illogical-impulse-*/PKGBUILD; do
+        awk -f "$prog" "$f"
     done | grep -v '^$' || true
+    rm -f "$prog"
 }
 
 prepare_ii_packages() {
@@ -371,21 +434,36 @@ patch_sddm_theme() {
 
 # Bibata-Modern-Classic cursor (AUR-only, so it is bundled from the upstream release like the dots)
 fetch_cursor_theme() { # $1 = destination dir inside the overlay
-    local dir=$STATE_DIR/bibata tmp
+    local dir=$STATE_DIR/bibata tmp tag url file sum
     mkdir -p "$dir" "$1"
-    tmp=$dir/new.tar.xz; rm -f "$tmp"
-    info "fetching the Bibata-Modern-Classic cursor theme"
-    if curl -fsSL -m 180 -z "$dir/Bibata-Modern-Classic.tar.xz" -o "$tmp" "$CURSOR_URL" && [[ -s $tmp ]]; then
-        mv "$tmp" "$dir/Bibata-Modern-Classic.tar.xz"
-    elif [[ -f $dir/Bibata-Modern-Classic.tar.xz ]]; then
-        info "cursor theme: using the cached copy"
+    if ((LATEST)); then
+        tag=latest; url=$CURSOR_REPO/releases/latest/download/Bibata-Modern-Classic.tar.xz
+        warn "Bibata cursor: --latest, the download is NOT checked against a checksum"
     else
-        die "cannot download $CURSOR_URL"
+        tag=$PIN_BIBATA_TAG; url=$CURSOR_REPO/releases/download/$tag/Bibata-Modern-Classic.tar.xz
     fi
-    rm -f "$tmp"
-    grep -q '^Bibata-Modern-Classic/cursors/' < <(tar -tf "$dir/Bibata-Modern-Classic.tar.xz" 2>/dev/null) \
+    file=$dir/Bibata-Modern-Classic-$tag.tar.xz
+    tmp=$dir/new.tar.xz; rm -f "$tmp"
+    if ! ((LATEST)) && [[ -f $file ]] && [[ $(sha256sum "$file" | cut -d' ' -f1) == "$PIN_BIBATA_SHA256" ]]; then
+        info "Bibata cursor $tag (cached, checksum ok)"
+    else
+        info "fetching the Bibata-Modern-Classic cursor theme ($tag)"
+        if curl -fsSL -m 180 -o "$tmp" "$url" && [[ -s $tmp ]]; then
+            mv "$tmp" "$file"
+        elif [[ -f $file ]] && ((LATEST)); then
+            info "cursor theme: using the cached copy"
+        else
+            die "cannot download $url"
+        fi
+        rm -f "$tmp"
+        if ! ((LATEST)); then
+            sum=$(sha256sum "$file" | cut -d' ' -f1)
+            [[ $sum == "$PIN_BIBATA_SHA256" ]] || { rm -f "$file"; die "Bibata $tag: sha256 mismatch (got $sum, expected $PIN_BIBATA_SHA256)"; }
+        fi
+    fi
+    grep -q '^Bibata-Modern-Classic/cursors/' < <(tar -tf "$file" 2>/dev/null) \
         || die "unexpected cursor archive layout"
-    install -Dm644 "$dir/Bibata-Modern-Classic.tar.xz" "$1/Bibata-Modern-Classic.tar.xz"
+    install -Dm644 "$file" "$1/Bibata-Modern-Classic.tar.xz"
 }
 
 # ------------------------------------------------------------------ profile staging
@@ -456,12 +534,12 @@ stage_profile() {
 main() {
     check_deps
     extract_payload
-    sync_repo "$DOTS_URL" "$DOTS_DIR" "dots"
-    sync_repo "$OMZ_URL" "$OMZ_DIR" "oh-my-zsh"
-    sync_repo "$SDDM_URL" "$SDDM_DIR" "sddm-slice theme"
-    sync_repo "$II_URL" "$II_DIR" "illogical-impulse (dots-hyprland)"
+    sync_repo "$DOTS_URL" "$DOTS_DIR" "dots" "${BLITZART_DOTS_REF:-}"
+    sync_repo "$OMZ_URL" "$OMZ_DIR" "oh-my-zsh" "$(pin "$PIN_OMZ")"
+    sync_repo "$SDDM_URL" "$SDDM_DIR" "sddm-slice theme" "$(pin "$PIN_SDDM")"
+    sync_repo "$II_URL" "$II_DIR" "illogical-impulse (dots-hyprland)" "$(pin "$PIN_II")"
     git -C "$II_DIR" submodule update --init --recursive --depth 1 -q || warn "dots-hyprland submodules could not be fetched"
-    sync_repo "$E4_URL" "$E4_DIR" "end4-pC"
+    sync_repo "$E4_URL" "$E4_DIR" "end4-pC" "$(pin "$PIN_E4")"
     install_artools_conf
     prepare_ii_packages
     check_package_names
