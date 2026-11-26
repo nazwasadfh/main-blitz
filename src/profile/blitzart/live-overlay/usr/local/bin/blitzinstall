@@ -813,7 +813,7 @@ phase_hyprpm() { # EXPERIMENTAL, graphical option only (after phase_ii, network)
     local u=$USER_NAME rc
     install -Dm755 "$SHARE/blitzart-hyprpm-setup" "$MNT/usr/local/bin/blitzart-hyprpm-setup"
     install -Dm644 "$SHARE/hyprpm-plugins.list" "$MNT/usr/local/share/blitzart/hyprpm-plugins.list"
-    msg "Installing Hyprland plugins with hyprpm (hyprflow, dynamic-cursors, hy3, hyprfocus) - this compiles, it takes a while"
+    msg "Installing Hyprland plugins with hyprpm (hyprflow, dynamic-cursors, hy3, hyprfocus, HyprWindowShade) - this compiles, it takes a while"
     trap ii_cleanup EXIT
     trap 'ii_cleanup; exit 130' INT TERM
     if ! install_sudo_grant "$u"; then

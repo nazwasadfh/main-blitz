@@ -19,7 +19,8 @@ writing - **verify them yourself** before redistributing.
 | hyprflow | github.com/sandwichfarm/hyprflow | Hyprland plugin (built on the target by hyprpm) | check its repository |
 | hypr-dynamic-cursors | github.com/VirtCode/hypr-dynamic-cursors | Hyprland plugin (hyprpm) | check its repository (BSD family) |
 | hy3 | github.com/outfoxxed/hy3 | Hyprland plugin (hyprpm) | check its repository (BSD family) |
-| hyprfocus | github.com/pyt0xic/hyprfocus | Hyprland plugin (hyprpm) | check its repository |
+| hyprland-plugins (hyprfocus) | github.com/hyprwm/hyprland-plugins | Hyprland plugins (hyprpm) | BSD-3-Clause (check its LICENSE) |
+| HyprWindowShade | github.com/ManofJELLO/HyprWindowShade | Hyprland plugin (hyprpm) | check its LICENSE |
 | nazwasadfh/dots | github.com/nazwasadfh/dots | user dotfiles (fastfetch, eza, kitty, starship, zsh, hypr) | set by its author |
 
 Pinned versions are in the `PINS` block of `tools/build-iso.in`; the exact commits used by a build are printed

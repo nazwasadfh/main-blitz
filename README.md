@@ -147,7 +147,8 @@ base system, then (graphical option) SDDM/Hyprland and illogical-impulse depende
 ## Hyprland plugins (hyprpm)
 
 With "Install graphical stuff", blitzinstall installs and enables the plugins that the dots' `hypr/` config actually
-uses (`usr/share/blitzart/hyprpm-plugins.list`): **hyprflow**, **dynamic-cursors**, **hy3**, **hyprfocus**
+uses (`usr/share/blitzart/hyprpm-plugins.list`): **hyprflow**, **dynamic-cursors**, **hy3**, **hyprfocus** (from `hyprwm/hyprland-plugins`; hyprpm builds all plugins
+of that repo but only hyprfocus is enabled) and **HyprWindowShade**
 (`hyprexpo` / `hyprglass` are only commented-out experiments there, so they are not installed - add a line to the list to get them).
 
 hyprpm is built for a *running* Hyprland: in a chroot `add`/`enable`/`update` fail ("Are you running hyprland?",
