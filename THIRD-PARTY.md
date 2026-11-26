@@ -21,6 +21,7 @@ writing - **verify them yourself** before redistributing.
 | hy3 | github.com/outfoxxed/hy3 | Hyprland plugin (hyprpm) | check its repository (BSD family) |
 | hyprland-plugins (hyprfocus) | github.com/hyprwm/hyprland-plugins | Hyprland plugins (hyprpm) | BSD-3-Clause (check its LICENSE) |
 | HyprWindowShade | github.com/ManofJELLO/HyprWindowShade | Hyprland plugin (hyprpm) | check its LICENSE |
+| Google Sans Flex, Patrick Hand | github.com/google/fonts (pinned commit) | fonts named in the illogical-impulse config.json | OFL-1.1 (licence files shipped in /usr/share/licenses/blitzart-fonts) |
 | nazwasadfh/dots | github.com/nazwasadfh/dots | user dotfiles (fastfetch, eza, kitty, starship, zsh, hypr) | set by its author |
 
 Pinned versions are in the `PINS` block of `tools/build-iso.in`; the exact commits used by a build are printed

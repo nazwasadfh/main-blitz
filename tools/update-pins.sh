@@ -19,7 +19,15 @@ NEW[PIN_BIBATA_TAG]=$tag
 tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
 curl -fsSL -o "$tmp" "$repo/releases/download/$tag/Bibata-Modern-Classic.tar.xz"
 NEW[PIN_BIBATA_SHA256]=$(sha256sum "$tmp" | cut -d' ' -f1)
-for k in PIN_OMZ PIN_SDDM PIN_II PIN_E4 PIN_BIBATA_TAG PIN_BIBATA_SHA256; do
+# Google fonts: newest commit of google/fonts + the checksums of the four files at that commit
+gref=$(git ls-remote https://github.com/google/fonts HEAD | cut -f1)
+NEW[PIN_GFONTS]=$gref
+gf() { curl -fsSL -m 240 "https://raw.githubusercontent.com/google/fonts/$gref/$1" | sha256sum | cut -d' ' -f1; }
+NEW[PIN_GF_PATRICK_SHA256]=$(gf ofl/patrickhand/PatrickHand-Regular.ttf)
+NEW[PIN_GF_PATRICK_OFL_SHA256]=$(gf ofl/patrickhand/OFL.txt)
+NEW[PIN_GF_GSFLEX_SHA256]=$(gf 'ofl/googlesansflex/GoogleSansFlex%5BROND,opsz,slnt,wdth,wght%5D.ttf')
+NEW[PIN_GF_GSFLEX_OFL_SHA256]=$(gf ofl/googlesansflex/OFL.txt)
+for k in PIN_OMZ PIN_SDDM PIN_II PIN_E4 PIN_BIBATA_TAG PIN_BIBATA_SHA256 PIN_GFONTS PIN_GF_PATRICK_SHA256 PIN_GF_PATRICK_OFL_SHA256 PIN_GF_GSFLEX_SHA256 PIN_GF_GSFLEX_OFL_SHA256; do
   old=$(sed -n "s/^$k=\"\(.*\)\"/\1/p" "$F")
   [[ -n ${NEW[$k]} ]] || { echo "no value for $k" >&2; exit 1; }
   if [[ $old == "${NEW[$k]}" ]]; then printf '= %-18s unchanged\n' "$k"

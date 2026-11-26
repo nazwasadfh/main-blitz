@@ -670,6 +670,39 @@ EOF
     info "cursor theme: $theme ($size)"
 }
 
+# Google Sans Flex + Patrick Hand (config.json of illogical-impulse), bundled in the ISO by build-iso (OFL)
+gui_fonts() {
+    [[ -d $SHARE/fonts ]] || { warn "no bundled fonts in this ISO (Google Sans Flex, Patrick Hand)"; return 0; }
+    install -d "$MNT/usr/share/fonts/blitzart" "$MNT/usr/share/licenses/blitzart-fonts"
+    install -m644 "$SHARE"/fonts/*.ttf "$MNT/usr/share/fonts/blitzart/"
+    install -m644 "$SHARE"/fonts/OFL-*.txt "$MNT/usr/share/licenses/blitzart-fonts/"
+    # the config names "JetBrains Mono NF"; the Nerd Fonts package calls the family "JetBrainsMono Nerd Font"
+    install -Dm644 /dev/stdin "$MNT/etc/fonts/conf.d/60-blitzart-aliases.conf" <<'FCEOF'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<fontconfig>
+  <alias binding="same"><family>JetBrains Mono NF</family><accept><family>JetBrainsMono Nerd Font</family></accept></alias>
+</fontconfig>
+FCEOF
+    ach fc-cache -f >/dev/null 2>&1 || warn "fc-cache failed"
+    info "fonts: Google Sans Flex, Patrick Hand installed"
+}
+
+# warn about every font family that the user's illogical-impulse config.json names but fontconfig cannot find
+gui_check_fonts() { # $1 = user
+    local rel=/home/$1/.config/illogical-impulse/config.json fam match
+    [[ -f $MNT$rel ]] || return 0
+    ach sh -c 'command -v jq >/dev/null' || return 0
+    while IFS= read -r fam; do
+        [[ -n $fam ]] || continue
+        match=$(ach fc-match -f '%{family}' "$fam" 2>/dev/null)
+        [[ $fam == "JetBrains Mono NF" && $match == *"JetBrainsMono N"* ]] && continue   # covered by the alias in 60-blitzart-aliases.conf
+        if [[ ",$match," != *",$fam,"* ]]; then
+            warn "font '$fam' (config.json) is not installed - fontconfig falls back to: ${match:-?}"
+        fi
+    done < <(ach jq -r '[paths(type == "string") as $p | select($p | map(tostring) | join(".") | test("font"; "i")) | getpath($p)] | unique[]' "$rel" 2>/dev/null)
+}
+
 phase_gui() { # EXPERIMENTAL: only runs when GUI=1; with GUI=0 the install is unchanged
     ((GUI)) || return 0
     msg "Installing graphical stack (EXPERIMENTAL)"
@@ -703,6 +736,7 @@ phase_gui() { # EXPERIMENTAL: only runs when GUI=1; with GUI=0 the install is un
 
     gui_dark_theme "$u"
     gui_cursor_theme "$u"
+    gui_fonts
 
     ach chown -R "$u:$u" "/home/$u"
 }
@@ -886,7 +920,9 @@ phase_ii() { # EXPERIMENTAL, graphical option only (runs AFTER the full upgrade)
     # 7) priority: the user's dots (kitty, fastfetch, eza, starship, .zshrc, hypr) are applied LAST, over ii's
     blitzart_apply_dots "$h"
     blitzart_apply_hypr "$h"
+    blitzart_apply_ii_config "$h"
     ach chown -R "$u:$u" "/home/$u"
+    gui_check_fonts "$u"
     info "illogical-impulse + end4-pC installed; your dots were applied on top"
 }
 

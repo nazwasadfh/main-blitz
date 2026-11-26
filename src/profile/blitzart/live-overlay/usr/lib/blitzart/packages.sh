@@ -41,6 +41,10 @@ BA_GUI_PKGS=(
     dconf gsettings-desktop-schemas xdg-desktop-portal-gtk
     # image formats for dolphin thumbnails / Qt apps
     libheif libavif kimageformats
+    # fonts named in the dots' illogical-impulse config.json: JetBrains Mono NF, Space Grotesk, Readex Pro come with ii's
+    # own dependency list (ttf-jetbrains-mono-nerd, otf-space-grotesk, ttf-readex-pro); Google Sans Flex and
+    # Patrick Hand are bundled by build-iso (/usr/share/blitzart/fonts). fontconfig is needed for fc-cache/fc-match.
+    fontconfig
     stow tmux jq
 )
 # downloaded during installation (not cached in the ISO)

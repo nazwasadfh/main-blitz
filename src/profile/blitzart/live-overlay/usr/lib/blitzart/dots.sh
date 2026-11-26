@@ -38,3 +38,15 @@ blitzart_apply_hypr() {
     [[ -n $owner ]] && chown -R "$owner" "$h/.config/hypr" 2>/dev/null
     return 0
 }
+
+# blitzart_apply_ii_config <home> [owner]  - only used by the graphical option.
+# The dots' config.json is the illogical-impulse settings file: it goes to ~/.config/illogical-impulse/config.json.
+# Applied AFTER ii's installer so that nothing overwrites it.
+blitzart_apply_ii_config() {
+    local h=$1 owner=${2:-}
+    [[ -f $BA_DOTS/config.json ]] || return 0
+    mkdir -p "$h/.config/illogical-impulse"
+    cp "$BA_DOTS/config.json" "$h/.config/illogical-impulse/config.json"
+    [[ -n $owner ]] && chown -R "$owner" "$h/.config/illogical-impulse" 2>/dev/null
+    return 0
+}

@@ -39,6 +39,11 @@ PIN_II="21733c3ca7f4edc20faafedea844dc96002c6f7f"
 PIN_E4="a28f6f7035e785fc61eee6cc004f8508779a9776"
 PIN_BIBATA_TAG="v2.0.7"
 PIN_BIBATA_SHA256="7d3495864e5bbef02f5e77de760b2905903b63c71495a78ef6306d19a3b556d8"
+PIN_GFONTS="5026800714d07231937d92eb4cceabf06e05d74e"   # github.com/google/fonts (OFL fonts: Patrick Hand, Google Sans Flex)
+PIN_GF_PATRICK_SHA256="0f173b3e6cb6d1af25babf7f0057c5ac4ee11f9992b0469bb817e967ef4ad0fc"
+PIN_GF_PATRICK_OFL_SHA256="377f4f9c19e935228552478eb68cc2ed82910988a60ba60e2ac73b09f32d02d1"
+PIN_GF_GSFLEX_SHA256="a9ac770798857d5e8ac593ced42b22e40a7c08cec98319f92b0eccc2783a77ba"
+PIN_GF_GSFLEX_OFL_SHA256="fc13d69f63e36d284b6e383d4d1463d8ad404f0aa065e57cf961252d51063137"
 # END PINS
 readonly CHAOTIC_MAX_AGE_DAYS=30
 readonly CHAOTIC_SETUP_VER=3   # bump when the keyring setup changes (invalidates cached setups)
@@ -478,6 +483,37 @@ patch_sddm_theme() {
 }
 
 # Bibata-Modern-Classic cursor (AUR-only, so it is bundled from the upstream release like the dots)
+# Fonts named in the dots' illogical-impulse config.json that no Arch/Chaotic package provides in a stable way
+# (the AUR packages download from URLs that move): taken from the Google Fonts repository at a pinned commit and
+# checked against sha256. Both are OFL-licensed; the licence files are shipped with them.
+fetch_google_fonts() { # $1 = destination dir inside the overlay
+    local dst=$1 dir=$STATE_DIR/fonts ref=$PIN_GFONTS spec path name sha got
+    mkdir -p "$dir" "$dst"
+    if ((LATEST)); then
+        ref=$(git ls-remote "https://github.com/google/fonts" HEAD | cut -f1)
+        [[ $ref =~ ^[0-9a-f]{40}$ ]] || die "cannot resolve google/fonts HEAD"
+        warn "Google fonts: --latest, downloads are NOT checked against checksums"
+    fi
+    for spec in \
+        "ofl/patrickhand/PatrickHand-Regular.ttf|PatrickHand-Regular.ttf|$PIN_GF_PATRICK_SHA256" \
+        "ofl/patrickhand/OFL.txt|OFL-PatrickHand.txt|$PIN_GF_PATRICK_OFL_SHA256" \
+        "ofl/googlesansflex/GoogleSansFlex%5BROND,opsz,slnt,wdth,wght%5D.ttf|GoogleSansFlex-VF.ttf|$PIN_GF_GSFLEX_SHA256" \
+        "ofl/googlesansflex/OFL.txt|OFL-GoogleSansFlex.txt|$PIN_GF_GSFLEX_OFL_SHA256"; do
+        IFS='|' read -r path name sha <<<"$spec"
+        if ! ((LATEST)) && [[ -f $dir/$ref-$name ]] && [[ $(sha256sum "$dir/$ref-$name" | cut -d' ' -f1) == "$sha" ]]; then
+            info "font $name (cached, checksum ok)"
+        else
+            info "fetching font $name"
+            curl -fsSL -m 240 -o "$dir/new.part" "https://raw.githubusercontent.com/google/fonts/$ref/$path" \
+                && [[ -s $dir/new.part ]] || { rm -f "$dir/new.part"; die "cannot download font $name"; }
+            got=$(sha256sum "$dir/new.part" | cut -d' ' -f1)
+            if ! ((LATEST)) && [[ $got != "$sha" ]]; then rm -f "$dir/new.part"; die "font $name: sha256 mismatch (got $got, expected $sha)"; fi
+            mv "$dir/new.part" "$dir/$ref-$name"
+        fi
+        install -Dm644 "$dir/$ref-$name" "$dst/$name"
+    done
+}
+
 fetch_cursor_theme() { # $1 = destination dir inside the overlay
     local dir=$STATE_DIR/bibata tmp tag url file sum
     mkdir -p "$dir" "$1"
@@ -531,11 +567,11 @@ stage_profile() {
     # installer + toolbox
     install -Dm755 "$STAGE/data/blitz" "$lo/usr/local/bin/blitz"
 
-    # dots (fastfetch, eza, hypr, kitty, starship.toml, .zshrc); hypr is only installed with the GUI option -> /usr/share/blitzart/dots
+    # dots (fastfetch, eza, hypr, kitty, starship.toml, .zshrc, config.json = illogical-impulse settings); hypr is only installed with the GUI option -> /usr/share/blitzart/dots
     local d=$lo/usr/share/blitzart/dots
     mkdir -p "$d"
     local item
-    for item in fastfetch eza hypr kitty starship.toml .zshrc; do
+    for item in fastfetch eza hypr kitty starship.toml .zshrc config.json; do
         if [[ -e $DOTS_DIR/$item ]]; then cp -a "$DOTS_DIR/$item" "$d/"; else warn "dots repo has no '$item'"; fi
     done
     # oh-my-zsh -> /usr/share/blitzart/oh-my-zsh (no .git)
@@ -548,6 +584,7 @@ stage_profile() {
     patch_sddm_theme "$lo/usr/share/blitzart/sddm-theme/sddm-slice"
 
     fetch_cursor_theme "$lo/usr/share/blitzart/cursors"
+    fetch_google_fonts "$lo/usr/share/blitzart/fonts"
 
     # illogical-impulse + end4-pC, each packed as one archive (with .git so they can be updated later)
     info "packing dots-hyprland and end4-pC into the ISO"

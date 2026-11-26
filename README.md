@@ -161,3 +161,13 @@ builds the plugins and keeps its state in `~/.local/share/hyprpm`; Hyprland load
 - After a Hyprland upgrade the plugins must be rebuilt for the new ABI: `blitz update` does it (`blitzart-hyprpm-setup --update`).
 - It compiles on the target machine, so the install takes a few minutes longer and needs the network (GitHub).
 - Not verified on a real Artix install - check `hyprpm list` after the first boot.
+
+## illogical-impulse settings and fonts
+
+- `config.json` from the root of the dots repo is copied to `~/.config/illogical-impulse/config.json` (graphical option only,
+  applied after ii's installer so nothing overwrites it).
+- Fonts it names: **JetBrains Mono NF**, **Space Grotesk**, **Readex Pro** come with ii's dependency list
+  (`ttf-jetbrains-mono-nerd`, `otf-space-grotesk`, `ttf-readex-pro`); **Google Sans Flex** (variable font, the config sets its
+  `wght`/`wdth`/`ROND` axes) and **Patrick Hand** have no stable Arch package, so `build-iso` takes them from `google/fonts`
+  at a pinned commit (sha256-checked, OFL licences included) and the installer puts them in `/usr/share/fonts/blitzart`.
+- After the install, every font family found in `config.json` is checked with fontconfig; missing ones are reported as warnings.
