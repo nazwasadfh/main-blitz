@@ -41,6 +41,7 @@ PIN_BIBATA_TAG="v2.0.7"
 PIN_BIBATA_SHA256="7d3495864e5bbef02f5e77de760b2905903b63c71495a78ef6306d19a3b556d8"
 # END PINS
 readonly CHAOTIC_MAX_AGE_DAYS=30
+readonly CHAOTIC_SETUP_VER=2   # bump when the keyring setup changes (invalidates cached setups)
 readonly STATE_DIR="/var/cache/blitzart-build"
 readonly MARK="# blitzart-managed"
 
@@ -290,14 +291,16 @@ cache_packages() { # conf db dest pkg...
 # chaotic-aur for the BUILD only: an isolated keyring (artix + arch + chaotic), the host keyring is not touched
 setup_chaotic_dl() {
     # trust the key again every $CHAOTIC_MAX_AGE_DAYS days (keys get rotated/revoked), not forever
-    [[ -n $(find "$STATE_DIR/chaotic.ok" -mtime "-$CHAOTIC_MAX_AGE_DAYS" 2>/dev/null) ]] && return 0
+    # (the marker also carries the setup version: an older/incomplete keyring setup is never reused)
+    [[ $(cat "$STATE_DIR/chaotic.ok" 2>/dev/null) == "$CHAOTIC_SETUP_VER" ]] \
+        && [[ -n $(find "$STATE_DIR/chaotic.ok" -mtime "-$CHAOTIC_MAX_AGE_DAYS" 2>/dev/null) ]] && return 0
     rm -rf "$CHAOTIC_GPG"; mkdir -p "$CHAOTIC_GPG"; chmod 700 "$CHAOTIC_GPG"
     pacman-key --gpgdir "$CHAOTIC_GPG" --init >/dev/null 2>&1 || return 1
     pacman-key --gpgdir "$CHAOTIC_GPG" --populate artix archlinux >/dev/null 2>&1 || return 1
     pacman-key --gpgdir "$CHAOTIC_GPG" --keyserver keyserver.ubuntu.com --recv-keys "$CHAOTIC_KEY" >/dev/null 2>&1 || return 1
     pacman-key --gpgdir "$CHAOTIC_GPG" --lsign-key "$CHAOTIC_KEY" >/dev/null 2>&1 || return 1
     chaotic_load_keyring || return 1
-    : >"$STATE_DIR/chaotic.ok"
+    printf %s "$CHAOTIC_SETUP_VER" >"$STATE_DIR/chaotic.ok"
 }
 
 # Chaotic's packages are signed by Garuda's PACKAGER keys (e.g. "TNE"), not by the master key above - trusting only
