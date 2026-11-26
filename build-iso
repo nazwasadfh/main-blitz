@@ -296,7 +296,39 @@ setup_chaotic_dl() {
     pacman-key --gpgdir "$CHAOTIC_GPG" --populate artix archlinux >/dev/null 2>&1 || return 1
     pacman-key --gpgdir "$CHAOTIC_GPG" --keyserver keyserver.ubuntu.com --recv-keys "$CHAOTIC_KEY" >/dev/null 2>&1 || return 1
     pacman-key --gpgdir "$CHAOTIC_GPG" --lsign-key "$CHAOTIC_KEY" >/dev/null 2>&1 || return 1
+    chaotic_load_keyring || return 1
     : >"$STATE_DIR/chaotic.ok"
+}
+
+# Chaotic's packages are signed by Garuda's PACKAGER keys (e.g. "TNE"), not by the master key above - trusting only
+# the master key gives "signature ... is unknown trust". Those keys ship in the chaotic-keyring package, which is
+# itself signed by the master key: verify that signature first, then load the keyring into the isolated gpgdir.
+chaotic_load_keyring() {
+    local d rc
+    d=$(mktemp -d)
+    _chaotic_load_keyring_in "$d"; rc=$?
+    rm -rf "$d"
+    return $rc
+}
+
+_chaotic_load_keyring_in() { # $1 = scratch dir
+    local d=$1 base=https://cdn-mirror.chaotic.cx/chaotic-aur status fpr kr
+    curl -fsSL -m 120 -o "$d/k.pkg" "$base/chaotic-keyring.pkg.tar.zst" \
+        && curl -fsSL -m 60 -o "$d/k.pkg.sig" "$base/chaotic-keyring.pkg.tar.zst.sig" \
+        || { warn "chaotic: cannot download chaotic-keyring"; return 1; }
+    status=$(gpg --homedir "$CHAOTIC_GPG" --status-fd 1 --verify "$d/k.pkg.sig" "$d/k.pkg" 2>/dev/null || true)
+    fpr=$(awk '$2 == "VALIDSIG" { print $NF }' <<<"$status")
+    [[ -n $fpr && $fpr == *"$CHAOTIC_KEY" ]] \
+        || { warn "chaotic: chaotic-keyring is not signed by the expected key (got: ${fpr:-none})"; return 1; }
+    mkdir -p "$d/x" && bsdtar -xf "$d/k.pkg" -C "$d/x" usr/share/pacman/keyrings \
+        || { warn "chaotic: cannot unpack chaotic-keyring"; return 1; }
+    kr=$d/x/usr/share/pacman/keyrings
+    if pacman-key --gpgdir "$CHAOTIC_GPG" --populate-from "$kr" chaotic >/dev/null 2>&1; then
+        return 0
+    fi
+    # older pacman-key without --populate-from: what --populate does, by hand
+    gpg --homedir "$CHAOTIC_GPG" --batch --import "$kr/chaotic.gpg" >/dev/null 2>&1 || return 1
+    [[ ! -f $kr/chaotic-trusted ]] || gpg --homedir "$CHAOTIC_GPG" --batch --import-ownertrust "$kr/chaotic-trusted" >/dev/null 2>&1
 }
 
 write_chaotic_conf() { # file
