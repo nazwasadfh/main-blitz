@@ -171,3 +171,11 @@ builds the plugins and keeps its state in `~/.local/share/hyprpm`; Hyprland load
   `wght`/`wdth`/`ROND` axes) and **Patrick Hand** have no stable Arch package, so `build-iso` takes them from `google/fonts`
   at a pinned commit (sha256-checked, OFL licences included) and the installer puts them in `/usr/share/fonts/blitzart`.
 - After the install, every font family found in `config.json` is checked with fontconfig; missing ones are reported as warnings.
+
+## UEFI boot entries (end of the installation)
+
+After a successful install, blitzinstall lists the firmware boot entries (`efibootmgr -v`) and lets you delete several, one or none
+(checklist, SPACE selects, Cancel/empty = delete nothing, then a confirmation). Suggested - and pre-ticked - are only:
+entries whose GPT partition exists on no disk of this machine (`stale`, e.g. a wiped old install) and older `BlitzArt` entries
+(`duplicate`). Windows, other distros, UEFI shell, PXE, USB are listed but never pre-ticked. The entry created by this
+installation (first in BootOrder, label `BlitzArt`) is not offered at all.

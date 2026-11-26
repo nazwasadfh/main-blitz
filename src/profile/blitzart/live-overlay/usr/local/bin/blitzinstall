@@ -974,6 +974,86 @@ do_install() {
     msg "Installation finished"
 }
 
+# ---------------------------------------------------------------- UEFI boot entries
+# `efibootmgr -v` on stdin -> one TAB-separated line per entry: num, label, path, tag
+#   tag: new       the entry grub-install just created (first in BootOrder, label BlitzArt) - never offered
+#        stale     points to a GPT partition that exists on no disk of this machine (e.g. a wiped old install)
+#        duplicate another entry labelled BlitzArt (an older install) - not the new one
+#        other     everything else (Windows, other distros, UEFI shell, PXE, USB ...)
+# $1 = the PARTUUIDs present on this machine, lower case, one per line
+efi_entries() {
+    awk -F'\t' -v present="$1" '
+        BEGIN { n = split(present, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") have[tolower(a[i])] = 1 }
+        /^BootOrder:/ { sub(/^BootOrder: */, ""); split($0, o, ","); first = o[1]; next }
+        /^Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/ {
+            num = substr($1, 5, 4); rest = substr($1, 9); sub(/^\*? */, "", rest)
+            label = rest; path = ($2 == "" ? "" : $2)
+            uuid = ""
+            if (match(path, /HD\([0-9]+,GPT,[0-9A-Fa-f-]+/)) {
+                u = substr(path, RSTART, RLENGTH); sub(/.*GPT,/, "", u); uuid = tolower(u)
+            }
+            nums[++cnt] = num; labels[cnt] = label; paths[cnt] = path; uuids[cnt] = uuid
+        }
+        END {
+            for (i = 1; i <= cnt; i++) {
+                tag = "other"
+                if (uuids[i] != "" && !(uuids[i] in have)) tag = "stale"
+                if (labels[i] == "BlitzArt") tag = (nums[i] == first && !newseen) ? "new" : "duplicate"
+                if (tag == "new") newseen = 1
+                short = paths[i]
+                if (match(short, /File\([^)]*\)/)) short = substr(short, RSTART + 5, RLENGTH - 6)
+                printf "%s\t%s\t%s\t%s\n", nums[i], labels[i], short, tag
+            }
+        }'
+}
+
+# Show the firmware boot entries and let the user remove some (several / one / none). Suggested for removal
+# (pre-ticked): entries of a wiped disk and older BlitzArt entries. Nothing else is ticked, nothing is removed
+# without a confirmation, and the entry that was just created is not offered at all.
+efi_cleanup() {
+    have efibootmgr || return 0
+    [[ -d /sys/firmware/efi/efivars ]] || return 0
+    local raw present entries num label path tag
+    raw=$(efibootmgr -v 2>/dev/null) || { warn "efibootmgr could not read the boot entries - skipping"; return 0; }
+    present=$(lsblk -rno PARTUUID 2>/dev/null)
+    entries=$(efi_entries "$present" <<<"$raw")
+    local -a items=() nums=()
+    local suggested=0 total=0 state note
+    while IFS=$'\t' read -r num label path tag; do
+        [[ -n $num ]] || continue
+        [[ $tag == new ]] && continue
+        total=$((total + 1))
+        state=off; note=""
+        case $tag in
+            stale)     state=on; note="[stale: its partition no longer exists] "; suggested=$((suggested + 1)) ;;
+            duplicate) state=on; note="[older BlitzArt install] "; suggested=$((suggested + 1)) ;;
+        esac
+        items+=("$num" "${label:0:34} ${note}${path:0:60}" "$state")
+        nums+=("$num")
+    done <<<"$entries"
+    ((total)) || return 0
+
+    local sel
+    sel=$(DLG --stdout --separate-output --title "UEFI boot entries" --checklist \
+"The firmware lists $total other boot entr$( ((total == 1)) && echo y || echo ies ). $suggested suggested for removal (ticked).
+Tick the ones to DELETE (several, one, or none) - SPACE selects, ENTER confirms.
+The new BlitzArt entry is not listed. Windows and other systems are not ticked." \
+        22 100 12 "${items[@]}") || return 0
+    [[ -n $sel ]] || return 0
+
+    local list="" n
+    for n in $sel; do
+        [[ $n =~ ^[0-9A-Fa-f]{4}$ ]] || continue
+        list+="  Boot$n  $(awk -F'\t' -v b="Boot$n" 'index($1, b) == 1 { sub(/^Boot[0-9A-Fa-f]{4}\*? ?/, "", $1); print $1; exit }' <<<"$raw")"$'\n'
+    done
+    [[ -n $list ]] || return 0
+    yesno "Delete these boot entries from the firmware?\n\n$list\nThis cannot be undone." "Confirm" || return 0
+    for n in $sel; do
+        [[ $n =~ ^[0-9A-Fa-f]{4}$ ]] || continue
+        efibootmgr -b "$n" -B >/dev/null 2>&1 && info "deleted Boot$n" || warn "could not delete Boot$n"
+    done
+}
+
 # ---------------------------------------------------------------- main
 case "${1:-}" in
     -h|--help) echo "Usage: blitzinstall   (interactive installer for BlitzArt Linux)"; exit 0 ;;
@@ -998,6 +1078,7 @@ if ((rc != 0)); then
     exit "$rc"
 fi
 rm -f "$MNT/etc/sudoers.d/$II_SUDOERS"
+efi_cleanup
 umount -R "$MNT" 2>/dev/null || true
 if yesno "BlitzArt is installed.\nReboot now? (remove the installation medium)" "Done"; then
     clear; reboot
