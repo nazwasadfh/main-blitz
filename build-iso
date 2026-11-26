@@ -41,7 +41,7 @@ PIN_BIBATA_TAG="v2.0.7"
 PIN_BIBATA_SHA256="7d3495864e5bbef02f5e77de760b2905903b63c71495a78ef6306d19a3b556d8"
 # END PINS
 readonly CHAOTIC_MAX_AGE_DAYS=30
-readonly CHAOTIC_SETUP_VER=2   # bump when the keyring setup changes (invalidates cached setups)
+readonly CHAOTIC_SETUP_VER=3   # bump when the keyring setup changes (invalidates cached setups)
 readonly STATE_DIR="/var/cache/blitzart-build"
 readonly MARK="# blitzart-managed"
 
@@ -326,12 +326,22 @@ _chaotic_load_keyring_in() { # $1 = scratch dir
     mkdir -p "$d/x" && bsdtar -xf "$d/k.pkg" -C "$d/x" usr/share/pacman/keyrings \
         || { warn "chaotic: cannot unpack chaotic-keyring"; return 1; }
     kr=$d/x/usr/share/pacman/keyrings
-    if pacman-key --gpgdir "$CHAOTIC_GPG" --populate-from "$kr" chaotic >/dev/null 2>&1; then
-        return 0
+    if ! pacman-key --gpgdir "$CHAOTIC_GPG" --populate-from "$kr" chaotic >/dev/null 2>&1; then
+        # older pacman-key without --populate-from: import the keys and their ownertrust by hand
+        gpg --homedir "$CHAOTIC_GPG" --batch --import "$kr/chaotic.gpg" >/dev/null 2>&1 \
+            || { warn "chaotic: cannot import chaotic.gpg"; return 1; }
+        [[ ! -f $kr/chaotic-trusted ]] || gpg --homedir "$CHAOTIC_GPG" --batch --import-ownertrust "$kr/chaotic-trusted" >/dev/null 2>&1
     fi
-    # older pacman-key without --populate-from: what --populate does, by hand
-    gpg --homedir "$CHAOTIC_GPG" --batch --import "$kr/chaotic.gpg" >/dev/null 2>&1 || return 1
-    [[ ! -f $kr/chaotic-trusted ]] || gpg --homedir "$CHAOTIC_GPG" --batch --import-ownertrust "$kr/chaotic-trusted" >/dev/null 2>&1
+    # the master keys listed in chaotic-trusted (the packages are signed by one of them, TNE) must also be signed
+    # locally - that is the last step of a real `pacman-key --populate`; without it the key stays "unknown trust".
+    local fpr v bad=0
+    while IFS=: read -r fpr _; do
+        [[ $fpr =~ ^[0-9A-Fa-f]{40}$ ]] || continue
+        pacman-key --gpgdir "$CHAOTIC_GPG" --lsign-key "$fpr" >/dev/null 2>&1 || true
+        v=$(gpg --homedir "$CHAOTIC_GPG" --with-colons --list-keys "$fpr" 2>/dev/null | awk -F: '/^pub/ { print $2; exit }')
+        [[ $v == f || $v == u ]] || { warn "chaotic: key ${fpr: -16} is not trusted after setup (validity '${v:-none}')"; bad=1; }
+    done <"$kr/chaotic-trusted"
+    return $bad
 }
 
 write_chaotic_conf() { # file
