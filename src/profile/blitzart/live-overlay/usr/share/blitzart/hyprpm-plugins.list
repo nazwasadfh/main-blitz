@@ -1,0 +1,13 @@
+# Hyprland plugins installed (and enabled) by blitzinstall / blitzart-hyprpm-setup.
+# Format: <git url> <plugin name as in the repo's hyprpm.toml>
+# Derived from the active (non-commented) code of the user's hypr/ config:
+#   hyprflow          hl.plugin.hyprflow.*, plugin.hyprflow = {...}            (modules/func/plugin-init.lua)
+#   dynamic-cursors   plugin.dynamic_cursors = {...}                           (modules/func/plugin-init.lua)
+#   hy3               "hy3" in the layout cycle                                (modules/func/layout-cycle.lua)
+#   hyprfocus         plugin.hyprfocus = {...} + animation leaf "hyprfocusIn" (plugin-init.lua, core/animations.lua)
+https://github.com/sandwichfarm/hyprflow          hyprflow
+https://github.com/VirtCode/hypr-dynamic-cursors  dynamic-cursors
+https://github.com/outfoxxed/hy3                  hy3
+https://github.com/pyt0xic/hyprfocus              hyprfocus
+# Present in the config only as commented-out experiments - add a line here to install them:
+# https://github.com/sandwichfarm/hyprexpo        hyprexpo

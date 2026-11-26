@@ -31,6 +31,10 @@ BA_BASE_PKGS=(
 BA_GUI_PKGS=(
     sddm sddm-dinit qt6-5compat qt6-virtualkeyboard ttf-roboto xorg-server
     hyprland hyprpm ninja xdg-desktop-portal-hyprland hyprlock hypridle qt5-wayland qt6-wayland qt6-svg
+    # hyprpm (builds Hyprland's headers + the plugins at install time): hyprpm's own list
+    # (cmake cpio hyprwayland-scanner pkg-config g++ gcc git) + Hyprland's optional deps for plugins
+    # (glaze hyprland-protocols meson) + ninja xorgproto; lua/pango/libinput/... for the plugins themselves
+    cmake cpio meson glaze hyprland-protocols hyprwayland-scanner xorgproto gcc make pkgconf git python lua sudo
     wl-clipboard playerctl brightnessctl swaybg
     # dark theme: GTK (Adwaita-dark), Qt6 + KDE apps (plasma-integration reads kdeglobals = BreezeDark), dconf default
     gnome-themes-extra adwaita-icon-theme plasma-integration breeze breeze-icons

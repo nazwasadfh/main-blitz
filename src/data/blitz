@@ -425,6 +425,21 @@ update_aur() {
 # GRUB_TIMEOUT=-1 (the BlitzArt default): the boot menu waits for a keypress, an unattended reboot stops there
 grub_waits_forever() { grep -qE '^GRUB_TIMEOUT=-1[[:space:]]*$' /etc/default/grub 2>/dev/null; }
 
+# A new Hyprland build changes its ABI: hyprpm's headers and the plugins must be rebuilt, otherwise the plugins do
+# not load ("Outdated headers"). Best effort, as the regular user, needs the network and a few minutes.
+update_hyprpm_plugins() { # $1 = `pacman -Q hyprland` before the upgrade
+    local before=$1 after
+    after=$(pacman -Q hyprland 2>/dev/null || true)
+    [[ -n $after && $after != "$before" ]] || return 0
+    have blitzart-hyprpm-setup || return 0
+    if [[ -z $REAL_USER || $REAL_USER == root ]] || [[ ! -d $(getent passwd "$REAL_USER" | cut -d: -f6)/.local/share/hyprpm ]]; then
+        return 0
+    fi
+    msg "Hyprland was upgraded - rebuilding the hyprpm headers and plugins for $REAL_USER"
+    sudo -u "$REAL_USER" -i blitzart-hyprpm-setup --update \
+        || warn "hyprpm update failed: run 'blitzart-hyprpm-setup --update' as $REAL_USER (the plugins load only after it succeeds)."
+}
+
 cmd_update() {
     local DO_MIRRORS=0 DO_AUR=0 DO_FLATPAK=0 DO_CLEAN=0 DO_NEWS=0 DO_SNAPSHOT=1 DO_REPO=1
     local DRY=0 REBOOT=0 REBOOT_IF=0 KEEP=0 ROLLBACK=0 ONLY="" IGNORE=""
@@ -547,6 +562,7 @@ cmd_update() {
             pacman -Sy || die "Database sync failed."
         fi
 
+        local HL_BEFORE; HL_BEFORE=$(pacman -Q hyprland 2>/dev/null || true)
         # ---- main upgrade ----
         msg "Upgrading system (pacman -Su)"
         if ! pacman -Su "${noconf[@]}" "${upflags[@]}"; then
@@ -565,6 +581,7 @@ cmd_update() {
         fi
         (( KEEP > 0 )) && root_is_btrfs && snapper_ok && prune_snapshots "$KEEP" '^blitz update' 1
         regen_grub
+        update_hyprpm_plugins "$HL_BEFORE"
     fi
 
     # ---- AUR ----

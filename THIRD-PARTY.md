@@ -16,6 +16,10 @@ writing - **verify them yourself** before redistributing.
 | illogical-impulse (dots-hyprland) | github.com/end-4/dots-hyprland | Hyprland setup (graphical option) | GPL-3.0 |
 | end4-pC | github.com/pctrade/end4-pC | default quickshell config (graphical option) | check its LICENSE file |
 | Bibata Modern Classic | github.com/ful1e5/Bibata_Cursor | cursor theme | GPL-3.0 |
+| hyprflow | github.com/sandwichfarm/hyprflow | Hyprland plugin (built on the target by hyprpm) | check its repository |
+| hypr-dynamic-cursors | github.com/VirtCode/hypr-dynamic-cursors | Hyprland plugin (hyprpm) | check its repository (BSD family) |
+| hy3 | github.com/outfoxxed/hy3 | Hyprland plugin (hyprpm) | check its repository (BSD family) |
+| hyprfocus | github.com/pyt0xic/hyprfocus | Hyprland plugin (hyprpm) | check its repository |
 | nazwasadfh/dots | github.com/nazwasadfh/dots | user dotfiles (fastfetch, eza, kitty, starship, zsh, hypr) | set by its author |
 
 Pinned versions are in the `PINS` block of `tools/build-iso.in`; the exact commits used by a build are printed

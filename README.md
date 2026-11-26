@@ -143,3 +143,20 @@ base system, then (graphical option) SDDM/Hyprland and illogical-impulse depende
   `*-dinit` packages; verify on a real system.
 - **License.** `LICENSE` (MIT) covers BlitzArt's own scripts; see `THIRD-PARTY.md` for everything else.
 - **CI.** `.github/workflows/ci.yml` regenerates `build-iso` and fails if it differs from the committed one, then runs syntax checks and shellcheck.
+
+## Hyprland plugins (hyprpm)
+
+With "Install graphical stuff", blitzinstall installs and enables the plugins that the dots' `hypr/` config actually
+uses (`usr/share/blitzart/hyprpm-plugins.list`): **hyprflow**, **dynamic-cursors**, **hy3**, **hyprfocus**
+(`hyprexpo` / `hyprglass` are only commented-out experiments there, so they are not installed - add a line to the list to get them).
+
+hyprpm is built for a *running* Hyprland: in a chroot `add`/`enable`/`update` fail ("Are you running hyprland?",
+"Headers outdated"), and it refuses to run as root. `blitzart-hyprpm-setup` therefore runs the real hyprpm **as the new user**
+(temporary passwordless sudo, only during the install) against a tiny stand-in socket that answers the three things hyprpm
+asks the compositor (version of the *installed* binary, loaded plugins, `/plugin load`). hyprpm itself clones Hyprland's headers,
+builds the plugins and keeps its state in `~/.local/share/hyprpm`; Hyprland loads them at login (the config runs `hyprpm reload -n`).
+
+- A failure never fails the installation; re-run `blitzart-hyprpm-setup` after the first boot (safe to repeat). Log: `/var/log/blitzart-hyprpm.log`.
+- After a Hyprland upgrade the plugins must be rebuilt for the new ABI: `blitz update` does it (`blitzart-hyprpm-setup --update`).
+- It compiles on the target machine, so the install takes a few minutes longer and needs the network (GitHub).
+- Not verified on a real Artix install - check `hyprpm list` after the first boot.

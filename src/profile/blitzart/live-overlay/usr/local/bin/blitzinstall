@@ -776,6 +776,21 @@ readonly II_SUDOERS=zzz-blitzart-install   # sorts last: in sudoers the LAST mat
 
 ii_cleanup() { rm -f "$MNT/etc/sudoers.d/$II_SUDOERS"; }
 
+# Passwordless sudo for $1 inside the new system, only while the graphical install phases run (removed by ii_cleanup).
+# NOPASSWD alone is NOT enough: `yay --sudoloop` calls `sudo -v`, and `sudo -v` demands a password even for NOPASSWD
+# rules ("sudo: a password is required", repeated forever). `!authenticate` removes that.
+install_sudo_grant() {
+    local u=$1 sf=$MNT/etc/sudoers.d/$II_SUDOERS
+    install -Dm440 /dev/stdin "$sf" <<<"Defaults:$u !authenticate
+$u ALL=(ALL:ALL) NOPASSWD: ALL"
+    if ! { visudo -c -f "$sf" >/dev/null && artix-chroot "$MNT" runuser -l "$u" -c 'sudo -n true && sudo -n -v'; }; then
+        warn "passwordless sudo does not work for $u in the new system."
+        artix-chroot "$MNT" sudo -l -U "$u" >&2 || true
+        ii_cleanup
+        return 1
+    fi
+}
+
 # which of ii's commands failed (whether you repeated or ignored them) - read from its log
 ii_failure_summary() {
     local log=$MNT/var/log/blitzart-ii.log clean n
@@ -786,6 +801,35 @@ ii_failure_summary() {
     warn "ii reported $n failed command(s):"
     grep 'has failed\.' <<<"$clean" | sort | uniq -c | sort -rn | head -8 | sed 's/^/    /' >&2
     warn "full log: /var/log/blitzart-ii.log; to finish later: cd ~/.cache/dots-hyprland && ./setup install"
+}
+
+# Hyprland plugins used by the user's hypr/ config (list: hyprpm-plugins.list), installed with hyprpm.
+# hyprpm is made for a RUNNING Hyprland: in a chroot `add`/`enable`/`update` refuse ("Are you running hyprland?",
+# "Headers outdated"), and it also refuses to run as root. blitzart-hyprpm-setup runs the real hyprpm as the new user
+# against a stand-in socket (see the header of that script); the plugins load when Hyprland starts (the config calls
+# `hyprpm reload -n`). A failure here never fails the installation: re-run `blitzart-hyprpm-setup` after the first boot.
+phase_hyprpm() { # EXPERIMENTAL, graphical option only (after phase_ii, network)
+    ((GUI)) || return 0
+    local u=$USER_NAME rc
+    install -Dm755 "$SHARE/blitzart-hyprpm-setup" "$MNT/usr/local/bin/blitzart-hyprpm-setup"
+    install -Dm644 "$SHARE/hyprpm-plugins.list" "$MNT/usr/local/share/blitzart/hyprpm-plugins.list"
+    msg "Installing Hyprland plugins with hyprpm (hyprflow, dynamic-cursors, hy3, hyprfocus) - this compiles, it takes a while"
+    trap ii_cleanup EXIT
+    trap 'ii_cleanup; exit 130' INT TERM
+    if ! install_sudo_grant "$u"; then
+        trap - EXIT INT TERM
+        warn "hyprpm plugins NOT installed. After the first boot, as $u: blitzart-hyprpm-setup"
+        return 0
+    fi
+    mkdir -p "$MNT/var/log"; : >"$MNT/var/log/blitzart-hyprpm.log"
+    artix-chroot "$MNT" runuser -l "$u" -c 'blitzart-hyprpm-setup' 2>&1 </dev/null | tee -a "$MNT/var/log/blitzart-hyprpm.log"
+    rc=${PIPESTATUS[0]}
+    ii_cleanup; trap - EXIT INT TERM
+    if ((rc != 0)); then
+        warn "some Hyprland plugins were not installed (log: /var/log/blitzart-hyprpm.log on the new system)."
+        warn "after the first boot, as $u: blitzart-hyprpm-setup   (it is safe to re-run)"
+    fi
+    return 0
 }
 
 phase_ii() { # EXPERIMENTAL, graphical option only (runs AFTER the full upgrade)
@@ -808,18 +852,11 @@ phase_ii() { # EXPERIMENTAL, graphical option only (runs AFTER the full upgrade)
     #    (R = repeat, i = ignore, e = exit) waits for YOU. Auto-answering does not work: several of its prompts are
     #    `while true` loops that only accept specific answers and would repeat forever.
     #    Setups are replicated below (they need a running dinit). Passwordless sudo exists only while this runs.
-    # NOPASSWD alone is NOT enough: ii runs `yay --sudoloop`, which calls `sudo -v`, and `sudo -v` demands a password
-    # even for NOPASSWD rules ("sudo: a password is required", repeated forever). `!authenticate` removes that.
-    local sf=$MNT/etc/sudoers.d/$II_SUDOERS
     trap ii_cleanup EXIT
     trap 'ii_cleanup; exit 130' INT TERM
-    install -Dm440 /dev/stdin "$sf" <<<"Defaults:$u !authenticate
-$u ALL=(ALL:ALL) NOPASSWD: ALL"
-    if ! { visudo -c -f "$sf" >/dev/null && artix-chroot "$MNT" runuser -l "$u" -c 'sudo -n true && sudo -n -v'; }; then
-        warn "passwordless sudo does not work for $u in the new system - NOT running the ii installer."
-        artix-chroot "$MNT" sudo -l -U "$u" >&2 || true
-        ii_cleanup; trap - EXIT INT TERM
-        warn "after the first boot, log in as $u and run: cd ~/.cache/dots-hyprland && ./setup install"
+    if ! install_sudo_grant "$u"; then
+        trap - EXIT INT TERM
+        warn "NOT running the ii installer. After the first boot, as $u: cd ~/.cache/dots-hyprland && ./setup install"
         return 0
     fi
     mkdir -p "$MNT/var/log"; : >"$MNT/var/log/blitzart-ii.log"
@@ -895,6 +932,7 @@ do_install() {
     phase_upgrade      # full upgrade, only now
     phase_gui_net
     phase_ii
+    phase_hyprpm
     phase_boot
     sync
     msg "Installation finished"
