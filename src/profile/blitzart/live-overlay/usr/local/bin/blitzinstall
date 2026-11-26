@@ -772,7 +772,9 @@ phase_ii_offline() { # EXPERIMENTAL: what comes from the ISO's offline repo (run
     ii_cached_aur_packages
 }
 
-ii_cleanup() { rm -f "$MNT/etc/sudoers.d/99-blitzart-install"; }
+readonly II_SUDOERS=zzz-blitzart-install   # sorts last: in sudoers the LAST matching rule wins
+
+ii_cleanup() { rm -f "$MNT/etc/sudoers.d/$II_SUDOERS"; }
 
 # which of ii's commands failed (whether you repeated or ignored them) - read from its log
 ii_failure_summary() {
@@ -806,9 +808,20 @@ phase_ii() { # EXPERIMENTAL, graphical option only (runs AFTER the full upgrade)
     #    (R = repeat, i = ignore, e = exit) waits for YOU. Auto-answering does not work: several of its prompts are
     #    `while true` loops that only accept specific answers and would repeat forever.
     #    Setups are replicated below (they need a running dinit). Passwordless sudo exists only while this runs.
-    install -Dm440 /dev/stdin "$MNT/etc/sudoers.d/99-blitzart-install" <<<"$u ALL=(ALL:ALL) NOPASSWD: ALL"
+    # NOPASSWD alone is NOT enough: ii runs `yay --sudoloop`, which calls `sudo -v`, and `sudo -v` demands a password
+    # even for NOPASSWD rules ("sudo: a password is required", repeated forever). `!authenticate` removes that.
+    local sf=$MNT/etc/sudoers.d/$II_SUDOERS
     trap ii_cleanup EXIT
     trap 'ii_cleanup; exit 130' INT TERM
+    install -Dm440 /dev/stdin "$sf" <<<"Defaults:$u !authenticate
+$u ALL=(ALL:ALL) NOPASSWD: ALL"
+    if ! { visudo -c -f "$sf" >/dev/null && artix-chroot "$MNT" runuser -l "$u" -c 'sudo -n true && sudo -n -v'; }; then
+        warn "passwordless sudo does not work for $u in the new system - NOT running the ii installer."
+        artix-chroot "$MNT" sudo -l -U "$u" >&2 || true
+        ii_cleanup; trap - EXIT INT TERM
+        warn "after the first boot, log in as $u and run: cd ~/.cache/dots-hyprland && ./setup install"
+        return 0
+    fi
     mkdir -p "$MNT/var/log"; : >"$MNT/var/log/blitzart-ii.log"
     msg "Running the illogical-impulse installer (log: /var/log/blitzart-ii.log on the new system)"
     artix-chroot "$MNT" runuser -l "$u" -c \
@@ -906,11 +919,11 @@ do_install 2>&1 | tee -a "$LOG"
 rc=${PIPESTATUS[0]}
 rm -f "$PACCONF"
 if ((rc != 0)); then
-    rm -f "$MNT/etc/sudoers.d/99-blitzart-install"
+    rm -f "$MNT/etc/sudoers.d/$II_SUDOERS"
     echo; warn "Installation FAILED (log: $LOG). The target is still mounted at $MNT."
     exit "$rc"
 fi
-rm -f "$MNT/etc/sudoers.d/99-blitzart-install"
+rm -f "$MNT/etc/sudoers.d/$II_SUDOERS"
 umount -R "$MNT" 2>/dev/null || true
 if yesno "BlitzArt is installed.\nReboot now? (remove the installation medium)" "Done"; then
     clear; reboot
