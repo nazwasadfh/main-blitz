@@ -1,181 +1,261 @@
 # BlitzArt Linux
 
-Artix (dinit) based distro: btrfs + snapper + grub-btrfs, repos artix / arch / chaotic-aur / blackarch,
-`blitz` system toolbox, `blitzinstall` installer (archinstall-like). Live ISO boots to tty.
+An [Artix](https://artixlinux.org) (dinit) based distribution with a rollback-friendly btrfs layout.
 
-## Build (on Artix)
+- **Base:** Artix + dinit, repositories artix / arch / chaotic-aur / blackarch
+- **Filesystem:** btrfs + snapper + grub-btrfs. Every pacman transaction gets a snapshot, and you can boot any snapshot from GRUB
+- **`blitzinstall`:** an archinstall-style menu installer that works offline from the ISO
+- **`blitz`:** a system toolbox for safe updates, snapshots, health checks and maintenance
+- **Live ISO:** boots to a console. An optional, **experimental** graphical install adds Hyprland, SDDM and end-4's illogical-impulse
 
-    sudo pacman -S artools-iso        # build-iso offers to install the rest
-    ./build-iso                       # one file, nothing else needed
-    ./build-iso -q                    # dry run (buildiso -q)
-    ./build-iso -n                    # no offline repo (smaller ISO, installer downloads everything)
+The whole ISO builder is a single file: `./build-iso`.
 
-build-iso: clones/updates `nazwasadfh/dots` into /tmp/blitzart-dots (and oh-my-zsh into /tmp/blitzart-omz),
-stages the profile into `~/artools-workspace/iso-profiles`, writes `~/.config/artools/pacman.conf.d/iso-*.conf` (and the legacy `pacman-default.conf`)
-(artix + arch repos, ILoveCandy), checks that every profile package exists in those repos, and runs `buildiso -p blitzart -i dinit`.
+---
 
-Dots copied from the repo: `fastfetch`, `eza`, `kitty` -> `~/.config/`, `starship.toml` -> `~/.config/starship.toml`, `.zshrc` -> `~/.zshrc`.
+## Contents
 
-## Install layout
+- [Quick start](#quick-start)
+- [Building the ISO](#building-the-iso)
+- [Live ISO](#live-iso)
+- [Installing](#installing)
+- [The installed system](#the-installed-system)
+- [`blitz` toolbox](#blitz-toolbox)
+- [Graphical option (experimental)](#graphical-option-experimental)
+- [Repository layout and development](#repository-layout-and-development)
+- [Known limitations](#known-limitations)
+- [License](#license)
 
-- GPT + UEFI only: ESP 1G (`/boot/efi`) + btrfs root; no /home partition.
-- Subvolumes: `@` (/, includes /home, /var/log, kernels) · `@snapshots` (/.snapshots) · `@pkg` (/var/cache/pacman/pkg).
-  A snapshot of `/` therefore rolls back the whole system, home included. `/` in fstab has no `subvol=`
-  so grub-btrfs snapshot entries boot correctly.
-- chrony + chrony-dinit installed, service `chronyd` enabled (time sync) - on the installed system and in the live ISO.
-- snapper config `root` (what `blitz` expects), baseline snapshot after install, `grub-btrfsd` as dinit service.
-- Plain `pacman`/`paru` transactions (install/upgrade/remove) get a snapper pre/post pair via pacman hooks
-  (`blitzart-snap`). Skipped when pacman is driven by `blitz` (blitz update makes its own pair) or when
-  `BLITZART_NO_SNAP=1` is set. Number cleanup keeps the last 50 (10 important).
-- os-release: NAME/PRETTY_NAME = "BlitzArt", ID=artix, ID_LIKE=arch (re-applied by a pacman hook), /etc/motd.
+---
 
-## Sources
+## Quick start
 
-`src/` is the real source; `tools/bundle.sh` regenerates the single-file `build-iso`.
+On an Artix machine:
 
-## Live ISO login (hostname: blitz-live)
+```sh
+sudo pacman -S artools-iso
+git clone https://github.com/nazwasadfh/main-blitz && cd main-blitz
+./build-iso
+```
 
-Users `blitzart` (sudo, passwordless) and `root`; password for both: `blitz`.
-Shown on the tty login prompt (/etc/issue), in /etc/motd and in a welcome box at the start of blitzinstall.
+Write the resulting ISO to a USB stick and boot it (UEFI only). Log in on tty1, and `blitzinstall` starts automatically.
 
-## User services (dinit)
+## Building the ISO
 
-`dinit-user-spawn` is installed and enabled (live via profile.yaml services, installed system via boot.d), so `dinitctl list` works as a normal
-user (user services in `~/.config/dinit.d`). turnstile is intentionally not used (it conflicts with elogind's
-rundir handling; the Artix wiki says not to run both).
+```sh
+./build-iso            # build the BlitzArt live ISO
+./build-iso -q         # dry run: show what buildiso would do (buildiso -q)
+./build-iso -n         # no offline repo: smaller ISO, the installer downloads everything
+./build-iso -y         # answer yes to prompts (e.g. move aside a foreign iso-profiles dir)
+./build-iso --latest   # ignore the pins and use the newest third-party sources
+./build-iso -h         # help
+```
 
-GRUB on the installed system: `GRUB_TIMEOUT=-1` (menu waits for a choice), `GRUB_TIMEOUT_STYLE=menu`.
+`build-iso` offers to install any build dependencies it is missing. It needs only `artools-iso`.
 
-## Audio (PipeWire, per-user dinit services)
+| Environment variable | Meaning | Default |
+|---|---|---|
+| `BLITZART_DOTS_URL` | dotfiles repository | `https://github.com/nazwasadfh/dots` |
+| `BLITZART_DOTS_REF` | pin the dots to a full commit sha | branch head |
+| `BLITZART_DOTS_DIR` | local checkout of the dots | `/tmp/blitzart-dots` |
+| `WORKSPACE_DIR` | artools workspace | `~/artools-workspace` |
 
-`pipewire`, `pipewire-pulse`, `wireplumber` + their `-dinit` packages are installed. The three user services
-(`pipewire`, `pipewire-pulse`, `wireplumber`) are enabled via `~/.config/dinit.d/boot.d/` for the created user
-and for `/etc/skel` (new users); in the live session through the live skel. Requires `dinit-user-spawn`.
+### What a build does
 
-## Graphical stack (EXPERIMENTAL, off by default)
+1. Clones or updates the dots (`nazwasadfh/dots`) and oh-my-zsh into `/tmp`.
+2. Stages the `blitzart` profile into `~/artools-workspace/iso-profiles`.
+3. Writes `~/.config/artools/pacman.conf.d/iso-*.conf` and the legacy `pacman-default.conf` (artix + arch repos, `ILoveCandy`).
+4. Checks that every package in the profile exists in those repos.
+5. Builds an **offline repo** inside the ISO, unless you pass `-n`, so the installer does not have to download the base system and tools.
+6. Runs `buildiso -p blitzart -i dinit`.
 
-blitzinstall menu: "Install graphical stuff (EXPERIMENTAL)" - default **No**. With No nothing changes
-(the live ISO and the default install stay console-only).
+Third-party sources (oh-my-zsh, sddm-slice, dots-hyprland, end4-pC, the Bibata cursor and two Google fonts) are fetched at **pinned commits or tags**, and the tarballs and fonts are checked with sha256. The commits used are printed during the build. `build-iso` runs as root, but it never sources third-party PKGBUILDs: it reads their dependency lists with a text parser.
 
-With **Yes**, additionally:
-- `sddm` + `sddm-dinit` (service enabled; never started in the live ISO), theme **sddm-slice**
-  (cloned at build time, copied from the ISO; `/etc/sddm.conf` -> `[Theme] Current=sddm-slice`);
-  theme deps `qt6-5compat`, `qt6-virtualkeyboard`, `ttf-roboto`; `xorg-server` for sddm's X11 greeter.
-- `hyprland`, `hyprpm` (+ `ninja`, for building plugins) (+ portal, hyprlock, hypridle, qt wayland, wl-clipboard, playerctl, brightnessctl, swaybg),
-  (the dots' `hypr` directory is NOT copied).
-- `kitty`, `dolphin` (pacman, network) and `brave-bin` (chaotic-aur, network).
+## Live ISO
 
-All sddm/hyprland packages and the theme are cached in the ISO (offline repo), so the ISO grows by
-roughly a gigabyte. Built with `-n` they are downloaded instead.
+| | |
+|---|---|
+| Hostname | `blitz-live` |
+| Users | `blitzart` (passwordless sudo) and `root` |
+| Password (both) | `blitz` |
 
-sddm-slice fix: the theme ships Qt6 imports but no `QtVersion` in `metadata.desktop`, so SDDM started the
-Qt5 greeter ("Library import requires a version") and fell back to the default theme. build-iso patches the
-staged theme (`QtVersion=6`) and blitzinstall re-checks it when copying the theme to the target.
+The credentials are also shown on the tty login prompt, in `/etc/motd` and in a welcome box when `blitzinstall` starts. The live session runs NetworkManager, chronyd (time sync), PipeWire and `dinit-user-spawn`. It ships the same basic tool set as an installed system: zsh, starship, eza, bat, fzf, zoxide, mcfly, fastfetch, neovim and others.
 
-### Dark theme (GUI option only)
+## Installing
 
-GTK 3/4: Adwaita-dark (`gnome-themes-extra`, `settings.ini`, `GTK_THEME=Adwaita:dark`, dconf default `prefer-dark`
-+ `xdg-desktop-portal-gtk` settings portal). Qt6 and KDE apps (dolphin): platform theme `kde`
-(`plasma-integration`, `QT_QPA_PLATFORMTHEME=kde`) reading `~/.config/kdeglobals` = BreezeDark + Breeze style + `breeze-dark` icons.
-The dots' hypr `env.lua` also sets `QT_QPA_PLATFORMTHEME=kde`, which only works when `plasma-integration` is installed
-(without it Qt silently falls back to the light default). `/usr/local/bin/dolphin` is a tiny wrapper that guarantees the env.
-Image formats for thumbnails: `libheif`, `libavif`, `kimageformats`.
+`blitzinstall` is a `dialog` menu. You configure the items in any order and then choose **Install**:
 
-### Cursor (GUI option only)
+1. Hostname
+2. Disk configuration: automatic or manual partitions
+3. Kernels: any of `linux` (default), `linux-lts` and `linux-zen`. The matching `linux-headers` are installed for DKMS
+4. Root password
+5. User account
+6. Timezone
+7. Locale / keymap
+8. Additional packages from any enabled repo
+9. Install graphical stuff (**EXPERIMENTAL**, default **No**)
 
-Bibata-Modern-Classic (regular, size 24) for Wayland, X11 and XWayland. It is AUR-only, so build-iso bundles the upstream
-release tarball into the ISO (cached in /var/cache/blitzart-build/bibata) and blitzinstall unpacks it to
-`/usr/share/icons`. Set via `XCURSOR_THEME`/`XCURSOR_SIZE` (`/etc/profile.d/blitzart-cursor.sh`, `/etc/environment`),
-`/usr/share/icons/default/index.theme` (X11 fallback), GTK `settings.ini` and a dconf default.
+The disk picker lists real disks, virtio disks included, and warns you if you select the live medium. The installer needs a network connection. If none is available, it offers to set one up with `nmtui`.
 
+### Install order
 
-## illogical-impulse + end4-pC (GUI option only)
+Everything that comes from the ISO's offline repo is installed first, so those packages are older than the repos but consistent with each other. That covers the base system and, with the graphical option, SDDM, Hyprland and the illogical-impulse dependencies. Next, a full `pacman -Syu` runs. Only after that are the network-only packages installed (`paru`, kitty, dolphin, brave) and ii's installer run. This order avoids partial upgrades, such as an old base mixed with a fresh Qt/KF6.
 
-With the graphical option the installer sets up end-4's **illogical-impulse** the way its own installer does
-(`curl -s https://ii.clsty.link/get` clones `end-4/dots-hyprland` into `~/.cache/dots-hyprland` and runs `./setup install`),
-except that everything it can is already inside the ISO:
+### UEFI boot-entry cleanup
 
-- **In the ISO:** `end-4/dots-hyprland` (with submodules), `pctrade/end4-pC`, your dots (incl. `hypr/`), and an offline repo with
-  every ii dependency that exists in the Artix/Arch repos, plus the prebuilt AUR ones that chaotic-aur has (cached at build time
-  with an isolated keyring, signatures verified). The package lists are read from ii's own `sdata/dist-arch/*/PKGBUILD`.
-- **At install time:** `./setup install --force --skip-sysupdate --skip-plasmaintg --skip-fish --skip-allsetups`
-  runs as your user in the target. It still needs the network for what cannot be cached: `quickshell` and `microtex`
-  (built from git by ii's PKGBUILDs), AUR leftovers (e.g. fonts), Google Sans Flex, the python venv (`uv`).
-  `ii`'s setups step needs a running init, so its dinit equivalents are applied directly (i2c group + module, ydotool and
-  bluetooth services, user services).
-- **Priority:** your dots are applied LAST, over ii's: `kitty`, `fastfetch`, `eza`, `starship.toml`, `.zshrc` replace ii's,
-  and your `hypr/` is MERGED over ii's (your files win; files only ii ships, such as
-  `custom/scripts/__restore_video_wallpaper.sh`, stay).
-- **end4-pC:** extracted to `~/.config/quickshell/end4-pC` AFTER ii (ii's file step does `rsync --delete` on all of
-  `~/.config/quickshell`). Your `hypr` starts it with `qs -c ~/.config/quickshell/end4-pC/`.
-- If ii's installer fails, the install continues with a warning; re-run `cd ~/.cache/dots-hyprland && ./setup install`.
+At the end of a successful install, `blitzinstall` lists the firmware boot entries (`efibootmgr -v`) in a checklist, and you can delete any number of them, or none. Only two kinds of entry are pre-ticked:
 
-## Install order and why
+- **stale** entries, whose GPT partition no longer exists on any disk in the machine
+- **duplicate** entries, which are older `BlitzArt` entries
 
-Everything that comes from the ISO's offline repo is installed first (older, but consistent with each other):
-base system, then (graphical option) SDDM/Hyprland and illogical-impulse dependencies. Only then does
-`phase_upgrade` run a full `pacman -Syu`, and only after that are network-only packages installed
-(`paru`, kitty, dolphin, brave) and ii's own installer run. This avoids partial upgrades (old base + fresh Qt/KF6).
+Windows, other distros, the UEFI shell, PXE and USB entries are listed but never pre-ticked. The entry this installation just created is not offered. A confirmation step follows before anything is deleted.
 
-- Snapshots: the "BlitzArt fresh install" baseline has no cleanup algorithm and `important=yes`, so snapper's
-  number cleanup never removes it; `blitz snapshot prune` skips it too (delete it explicitly if you really want to).
-- Dual-boot: `os-prober` is installed and enabled in GRUB (GRUB_DISABLE_OS_PROBER=false). It adds a few seconds
-  to every `grub-mkconfig`, including the ones grub-btrfsd triggers after each snapshot.
-- Disk picker: lists real disks by TYPE (virtio disks are no longer hidden) and warns if you pick the live medium.
-- `linux-headers` for every selected kernel are installed (DKMS).
-- [blackarch] uses the default SigLevel; `blackarch-keyring` is installed after the upgrade.
+## The installed system
 
-## Pinned sources, BlackArch, ii, GRUB (notes)
+### Disk layout
 
-- **Pins.** oh-my-zsh, sddm-slice, dots-hyprland, end4-pC are fetched at an exact commit and the Bibata cursor at a tag
-  verified by sha256 (`PINS` block in `tools/build-iso.in`). `./build-iso --latest` ignores the pins. `tools/update-pins.sh`
-  shows newer upstream versions (`--write` applies them; then run `tools/bundle.sh`). Your own dots follow the branch head
-  unless `BLITZART_DOTS_REF=<full sha>` is set.
-- **Security.** `build-iso` runs as root but never sources third-party PKGBUILDs; dependency lists are read with a text parser.
-- **BlackArch.** Added the way the official `strap.sh` does it: keyring package + signature verified against the
-  published signer fingerprints, `pacman-key --populate blackarch`, then the repo with the default SigLevel.
-  If it fails the repo is skipped with a warning.
-- **illogical-impulse is interactive.** The installer is not auto-answered. If a command fails, ii's own prompt
-  (`R` repeat / `i` ignore / `e` exit) waits for you. Log: `/var/log/blitzart-ii.log`; a failure summary is printed
-  afterwards. To finish later: `cd ~/.cache/dots-hyprland && ./setup install`.
-- **GRUB_TIMEOUT=-1.** The boot menu waits for a keypress, so `blitz update --reboot` asks before rebooting (and refuses with `-y`).
-- **dinit services are best effort.** Service names (`chronyd`, `bluetoothd`, `NetworkManager`, ...) depend on the
-  `*-dinit` packages; verify on a real system.
-- **License.** `LICENSE` (MIT) covers BlitzArt's own scripts; see `THIRD-PARTY.md` for everything else.
-- **CI.** `.github/workflows/ci.yml` regenerates `build-iso` and fails if it differs from the committed one, then runs syntax checks and shellcheck.
+- GPT + UEFI only: a 1 GiB ESP at `/boot/efi` plus a btrfs root. There is no separate `/home` partition.
+- Subvolumes:
 
-## Hyprland plugins (hyprpm)
+  | Subvolume | Mount | Notes |
+  |---|---|---|
+  | `@` | `/` | includes `/home`, `/var/log` and the kernels |
+  | `@snapshots` | `/.snapshots` | |
+  | `@pkg` | `/var/cache/pacman/pkg` | excluded from snapshots |
 
-With "Install graphical stuff", blitzinstall installs and enables the plugins that the dots' `hypr/` config actually
-uses (`usr/share/blitzart/hyprpm-plugins.list`): **hyprflow**, **dynamic-cursors**, **hy3**, **hyprfocus** (from `hyprwm/hyprland-plugins`; hyprpm builds all plugins
-of that repo but only hyprfocus is enabled) and **HyprWindowShade**
-(`hyprexpo` / `hyprglass` are only commented-out experiments there, so they are not installed - add a line to the list to get them).
+  A snapshot of `/` therefore rolls back the **whole system, home included**. The fstab entry for `/` has no `subvol=`, so the grub-btrfs snapshot entries boot correctly.
 
-hyprpm is built for a *running* Hyprland: in a chroot `add`/`enable`/`update` fail ("Are you running hyprland?",
-"Headers outdated"), and it refuses to run as root. `blitzart-hyprpm-setup` therefore runs the real hyprpm **as the new user**
-(temporary passwordless sudo, only during the install) against a tiny stand-in socket that answers the three things hyprpm
-asks the compositor (version of the *installed* binary, loaded plugins, `/plugin load`). hyprpm itself clones Hyprland's headers,
-builds the plugins and keeps its state in `~/.local/share/hyprpm`; Hyprland loads them at login (the config runs `hyprpm reload -n`).
+### Snapshots
 
-- A failure never fails the installation; re-run `blitzart-hyprpm-setup` after the first boot (safe to repeat). Log: `/var/log/blitzart-hyprpm.log`.
-- After a Hyprland upgrade the plugins must be rebuilt for the new ABI: `blitz update` does it (`blitzart-hyprpm-setup --update`).
-- It compiles on the target machine, so the install takes a few minutes longer and needs the network (GitHub).
-- Not verified on a real Artix install - check `hyprpm list` after the first boot.
+- snapper config `root`, which is what `blitz` expects.
+- A baseline snapshot, **"BlitzArt fresh install"**, is created after the install. It is marked `important=yes` and has no cleanup algorithm, so neither snapper nor `blitz snapshot prune` ever removes it. You have to delete it explicitly.
+- Plain `pacman`/`paru` transactions get a snapper pre/post pair through pacman hooks (`blitzart-snap`). The hooks are skipped when `blitz` drives pacman, because `blitz update` takes its own pair, or when `BLITZART_NO_SNAP=1` is set.
+- Number cleanup keeps the last 50 snapshots (10 important).
+- `grub-btrfsd` runs as a dinit service and adds every snapshot to the GRUB menu.
 
-## illogical-impulse settings and fonts
+### Boot
 
-- `config.json` from the root of the dots repo is copied to `~/.config/illogical-impulse/config.json` (graphical option only,
-  applied after ii's installer so nothing overwrites it).
-- Fonts it names: **JetBrains Mono NF**, **Space Grotesk**, **Readex Pro** come with ii's dependency list
-  (`ttf-jetbrains-mono-nerd`, `otf-space-grotesk`, `ttf-readex-pro`); **Google Sans Flex** (variable font, the config sets its
-  `wght`/`wdth`/`ROND` axes) and **Patrick Hand** have no stable Arch package, so `build-iso` takes them from `google/fonts`
-  at a pinned commit (sha256-checked, OFL licences included) and the installer puts them in `/usr/share/fonts/blitzart`.
-- After the install, every font family found in `config.json` is checked with fontconfig; missing ones are reported as warnings.
+- GRUB runs with `GRUB_TIMEOUT=-1` and `GRUB_TIMEOUT_STYLE=menu`, so the menu waits for your choice.
+- `os-prober` is enabled (`GRUB_DISABLE_OS_PROBER=false`) for dual-boot. This adds a few seconds to every `grub-mkconfig`, including the runs that grub-btrfsd triggers.
 
-## UEFI boot entries (end of the installation)
+### Services (dinit)
 
-After a successful install, blitzinstall lists the firmware boot entries (`efibootmgr -v`) and lets you delete several, one or none
-(checklist, SPACE selects, Cancel/empty = delete nothing, then a confirmation). Suggested - and pre-ticked - are only:
-entries whose GPT partition exists on no disk of this machine (`stale`, e.g. a wiped old install) and older `BlitzArt` entries
-(`duplicate`). Windows, other distros, UEFI shell, PXE, USB are listed but never pre-ticked. The entry created by this
-installation (first in BootOrder, label `BlitzArt`) is not offered at all.
+- **System:** chronyd (time sync), NetworkManager, elogind, dbus, cronie, openssh and others.
+- **User services:** `dinit-user-spawn` is enabled, so `dinitctl list` works as a normal user, with services in `~/.config/dinit.d`. turnstile is intentionally not used, because it conflicts with elogind's rundir handling and the Artix wiki says not to run both.
+- **Audio:** `pipewire`, `pipewire-pulse` and `wireplumber` run as per-user services, enabled via `~/.config/dinit.d/boot.d/` for the created user and through `/etc/skel` for new users.
+
+### Branding, repos and shell
+
+- `os-release` has `NAME`/`PRETTY_NAME` set to `BlitzArt`, `ID=artix` and `ID_LIKE=arch`. A pacman hook re-applies these values after updates.
+- `[blackarch]` is added the way the official `strap.sh` does it: the keyring package's signature is verified against the published signer fingerprints, then `pacman-key --populate blackarch` runs and the repo is added with the default SigLevel. If any step fails, the repo is skipped with a warning.
+- Dots copied from `nazwasadfh/dots`: `fastfetch`, `eza` and `kitty` go to `~/.config/`, `starship.toml` goes to `~/.config/starship.toml` and `.zshrc` goes to `~/.zshrc`, with oh-my-zsh.
+
+## `blitz` toolbox
+
+```
+blitz <command> [options]          blitz <command> --help for details
+
+update,   upd, u     safe system update (snapshot, keyrings, repos, AUR, Flatpak)
+snapshot, snap, s    list | create | delete | restore | diff | prune
+restore              shortcut for 'snapshot restore'
+health,   check      check that the system is healthy
+clean                package cache, orphans, old @.broken-* subvolumes
+mirrors              refresh / rank mirror lists
+pacnew               list, diff and merge .pacnew/.pacsave files
+btrfs                status, usage, errors, scrub, balance
+boot                 bootloader status, GRUB / initramfs regeneration
+kernel               list, install and remove kernels
+info                 system overview
+```
+
+Some examples:
+
+```sh
+blitz update -a -m                 # refresh mirrors, update repos + AUR, with pre/post snapshots
+blitz update --rollback-on-fail    # restore the pre-update snapshot if the upgrade fails
+blitz update -d                    # list pending updates only
+blitz snapshot list
+blitz restore                      # pick a snapshot to roll back to
+blitz snapshot diff 12             # what changed since snapshot 12
+```
+
+`blitz update` also rebuilds the Hyprland plugins after a Hyprland upgrade. Because GRUB waits for input, `blitz update --reboot` asks before it reboots, and it refuses to reboot when combined with `-y`. Logs go to `/var/log/blitz.log`.
+
+## Graphical option (experimental)
+
+The default is **No**: the live ISO and the default install stay console-only. With **Yes**, the installer adds the following.
+
+### Desktop stack
+
+- **SDDM** (`sddm-dinit`, enabled on the target and never started in the live ISO) with the **sddm-slice** theme, plus `qt6-5compat`, `qt6-virtualkeyboard`, `ttf-roboto` and `xorg-server` for the X11 greeter.
+  - Fix: sddm-slice ships Qt6 imports without a `QtVersion` in `metadata.desktop`, so SDDM started the Qt5 greeter and fell back to the default theme. `build-iso` patches the theme to `QtVersion=6`, and `blitzinstall` checks the patch again when it copies the theme.
+- **Hyprland** with hyprpm (+ `ninja`), the portal, hyprlock, hypridle, Qt Wayland, wl-clipboard, playerctl, brightnessctl and swaybg.
+- **Apps:** `kitty` and `dolphin` from pacman, and `brave-bin` from chaotic-aur. All three are downloaded during the install.
+- **Dark theme:** Adwaita-dark for GTK 3/4 (`settings.ini`, `GTK_THEME`, a dconf `prefer-dark` default and the portal setting). For Qt6/KDE apps, `plasma-integration` with `QT_QPA_PLATFORMTHEME=kde` reads a BreezeDark `kdeglobals`. `/usr/local/bin/dolphin` is a small wrapper that guarantees the environment. Thumbnail support comes from `libheif`, `libavif` and `kimageformats`.
+- **Cursor:** Bibata-Modern-Classic at size 24 for Wayland, X11 and XWayland. It is AUR-only, so the release tarball is bundled into the ISO and unpacked to `/usr/share/icons`.
+
+The SDDM and Hyprland packages and the theme are cached in the ISO, which adds roughly **1 GB**. If you build with `-n`, they are downloaded during the install instead.
+
+### illogical-impulse + end4-pC
+
+The installer sets up end-4's **illogical-impulse** (`end-4/dots-hyprland`) the way its own installer does, but it takes everything it can from the ISO:
+
+- **In the ISO:** `dots-hyprland` with its submodules, `pctrade/end4-pC`, your dots (including `hypr/`), and an offline repo with every ii dependency available in the Artix/Arch repos or prebuilt on chaotic-aur. Those packages are cached with an isolated keyring and their signatures are verified. The package lists come from ii's own `sdata/dist-arch/*/PKGBUILD`.
+- **At install time:** `./setup install --force --skip-sysupdate --skip-plasmaintg --skip-fish --skip-allsetups` runs as your user inside the target. It still needs the network for what cannot be cached: `quickshell`, `microtex`, AUR leftovers and the Python venv (`uv`). ii's setup step needs a running init, so the installer applies dinit equivalents directly: the i2c group and module, the ydotool and bluetooth services and the user services.
+- **Order of precedence:** your dots are applied **last**. `kitty`, `fastfetch`, `eza`, `starship.toml` and `.zshrc` replace ii's files, and your `hypr/` is **merged** over ii's: your files win, and files that only ii ships stay.
+- **end4-pC** is extracted to `~/.config/quickshell/end4-pC` *after* ii runs, because ii's file step does an `rsync --delete` over `~/.config/quickshell`. Your `hypr` config starts it with `qs -c ~/.config/quickshell/end4-pC/`.
+- `config.json` from the root of your dots is copied to `~/.config/illogical-impulse/config.json` after ii finishes.
+- **Fonts:** JetBrains Mono NF, Space Grotesk and Readex Pro come with ii's dependencies. Google Sans Flex and Patrick Hand have no stable Arch package, so they come from `google/fonts` at a pinned commit (sha256-checked, OFL licences included) and are installed to `/usr/share/fonts/blitzart`. After the install, every font family named in `config.json` is checked with fontconfig.
+- **The ii installer is interactive and not auto-answered.** If a command fails, ii's own `R`/`i`/`e` prompt waits for you. If it fails completely, the BlitzArt install continues with a warning. The log is in `/var/log/blitzart-ii.log`. To finish later, run `cd ~/.cache/dots-hyprland && ./setup install`.
+
+### Hyprland plugins (hyprpm)
+
+The installer sets up the plugins that the dots' `hypr/` config actually uses, as listed in `usr/share/blitzart/hyprpm-plugins.list`: **hyprflow**, **dynamic-cursors**, **hy3**, **hyprfocus** (from `hyprwm/hyprland-plugins`) and **HyprWindowShade**. To add more, such as `hyprexpo`, add a line to that list.
+
+hyprpm expects a *running* Hyprland and refuses to run as root, so it fails in a chroot. `blitzart-hyprpm-setup` works around this by running the real hyprpm **as the new user**, with temporary passwordless sudo during the install only, against a small stand-in socket that answers hyprpm's three compositor queries. Hyprland loads the plugins at login (`hyprpm reload -n`).
+
+- A plugin failure never fails the installation. You can re-run `blitzart-hyprpm-setup` after the first boot; it is safe to repeat. The log is in `/var/log/blitzart-hyprpm.log`.
+- The plugins compile on the target, so the install takes a few minutes longer and needs network access to GitHub.
+
+## Repository layout and development
+
+```
+build-iso                 generated single-file builder (do not edit by hand)
+tools/build-iso.in        builder source, including the PINS block
+tools/bundle.sh           regenerates build-iso from tools/build-iso.in + src/
+tools/update-pins.sh      checks upstream for newer pinned versions
+src/data/blitz            the blitz toolbox
+src/profile/common/       common package set (artools iso-profiles schema)
+src/profile/blitzart/     the ISO profile
+  profile.yaml            live session, rootfs and livefs packages
+  root-overlay/           files on the installed system (os-release, motd)
+  live-overlay/           live ISO files: blitzinstall, hooks, helper scripts, skel
+```
+
+`src/` holds the actual sources, and `build-iso` is `tools/build-iso.in` followed by a base64 tarball of `src/`. After you change anything:
+
+```sh
+tools/bundle.sh                    # deterministic, so CI can diff it
+```
+
+Refreshing the pins:
+
+```sh
+tools/update-pins.sh               # dry run: show newer upstream versions
+tools/update-pins.sh --write       # update the PINS block
+tools/bundle.sh                    # then rebuild build-iso and review the diff
+```
+
+**CI** (`.github/workflows/ci.yml`) regenerates `build-iso` and fails if it differs from the committed file. It then runs `bash -n` and `shellcheck -S warning` on all scripts.
+
+## Known limitations
+
+- UEFI + GPT only; no BIOS/MBR support.
+- dinit service names (`chronyd`, `bluetoothd`, `NetworkManager`, …) depend on the `*-dinit` packages and are applied on a best-effort basis. Verify them on real hardware.
+- The graphical option, the hyprpm setup and the ii integration have **not been verified on a real Artix install**. After the first boot, check `hyprpm list` and the logs in `/var/log/blitzart-*.log`.
+- The installer needs a network connection even with the offline repo, for the full upgrade and the network-only packages.
+
+## License
+
+BlitzArt's own scripts (`build-iso`, `blitzinstall`, `blitz`, the hooks and the profile files) are under the [MIT license](LICENSE).
+
+Everything fetched at build or install time keeps its own license. That includes the Artix/Arch/BlackArch/Chaotic-AUR packages, oh-my-zsh, sddm-slice, illogical-impulse, end4-pC, Bibata, the Hyprland plugins, the Google fonts and the dots. A built ISO redistributes these components, so whoever distributes an ISO is responsible for complying with their licenses. See [THIRD-PARTY.md](THIRD-PARTY.md).
